@@ -24,6 +24,14 @@ from .features import (FEATURES, SideArrays, compute_features, _NAME_COLS, _ADDR
 PACK_MUL = 10_500_000  # > max cand index (10.3M)
 
 
+def _pos_of(universe: np.ndarray, ids: np.ndarray) -> np.ndarray:
+    """Order-independent id -> position mapping (universe need not be sorted)."""
+    pos = pd.Series(np.arange(len(universe)), index=universe).reindex(pd.Index(ids))
+    out = pos.to_numpy()
+    assert not pd.isna(out).any(), "id missing from universe"
+    return out.astype(np.int64)
+
+
 def _pack(p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
     return p1.astype(np.int64) * PACK_MUL + p2.astype(np.int64)
 
@@ -101,8 +109,8 @@ def run(cfg: dict, force: bool = False) -> dict:
     print("pass A: counting positives/negatives per shard...", flush=True)
     for si, sp in enumerate(shard_files):
         cand = pd.read_parquet(sp)
-        p1 = s1_ids.searchsorted(cand["s1_entity_id"].to_numpy())
-        p2 = cand_ids.searchsorted(cand["cand_id"].to_numpy())
+        p1 = _pos_of(s1_ids, cand["s1_entity_id"].to_numpy())
+        p2 = _pos_of(cand_ids, cand["cand_id"].to_numpy())
         y = _labels_for(p1, p2, gt_train)
         is_val = val_row_mask[p1]
         y_eff = np.where(is_val, 0, y)  # val rows never count as train positives
@@ -126,8 +134,8 @@ def run(cfg: dict, force: bool = False) -> dict:
     va_X, va_p1_all, va_p2_all = [], [], []
     for item in plan:
         cand = pd.read_parquet(shard_files[item["shard"]])
-        p1 = s1_ids.searchsorted(cand["s1_entity_id"].to_numpy())
-        p2 = cand_ids.searchsorted(cand["cand_id"].to_numpy())
+        p1 = _pos_of(s1_ids, cand["s1_entity_id"].to_numpy())
+        p2 = _pos_of(cand_ids, cand["cand_id"].to_numpy())
         del cand
         sel = np.unique(np.concatenate([item["pos"], item["neg"], item["val"]]))
         f = compute_features(A, B, p1[sel], p2[sel], is_s3_all[p2[sel]])

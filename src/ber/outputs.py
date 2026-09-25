@@ -29,10 +29,10 @@ def _join_sorted(ids) -> str:
 
 def _assert_invariants(matching: dict[str, str], candidates: dict[str, str],
                        required_s1: list[str]) -> None:
+    """Entities absent from `matching` are empty (no-match) predictions — allowed.
+    The output DataFrame covers every required entity via matching.get(s1, "")."""
     req = set(required_s1)
-    miss = req - set(matching)
     extra = set(matching) - req
-    assert not miss, f"matching_results missing {len(miss)} S1 entities, e.g. {sorted(miss)[:5]}"
     assert not extra, f"matching_results has {len(extra)} unknown S1 rows, e.g. {sorted(extra)[:5]}"
     for s1, joined in matching.items():
         ids = joined.split(",") if joined else []

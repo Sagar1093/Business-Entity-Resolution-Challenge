@@ -31,8 +31,16 @@ def count_rows(path: str | Path) -> int:
 
 
 def file_fingerprint(path: str | Path) -> dict:
-    """Cheap content fingerprint: size + head/tail hashes (not a full sha256 of GB files)."""
+    """Cheap content fingerprint: size + head/tail hashes (not a full sha256 of GB files).
+    Directories: fingerprint the sorted (name, size) listing + shard count."""
     p = Path(path)
+    if p.is_dir():
+        entries = sorted((f.name, f.stat().st_size) for f in p.iterdir())
+        h = hashlib.sha256()
+        for name, size in entries:
+            h.update(f"{name}:{size};".encode())
+        return {"path": str(p), "size": sum(s for _, s in entries),
+                "entries": len(entries), "fp": h.hexdigest()[:32]}
     size = p.stat().st_size
     h = hashlib.sha256()
     with open(p, "rb") as f:

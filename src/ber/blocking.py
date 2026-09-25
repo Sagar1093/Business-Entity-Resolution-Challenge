@@ -288,11 +288,7 @@ def iter_candidate_shards(split: str, cfg: dict):
         if g is not None:
             base = pd.concat([base, pd.read_parquet(g, columns=["s1_entity_id", "cand_id"])],
                              ignore_index=True)
-            pk = base["s1_entity_id"].to_numpy().astype(np.int64) << np.int64(32) | \
-                pd.factorize(base["cand_id"])[0].astype(np.int64)
-            # factorize ids differ per shard -> dedup on string pair instead:
             base = base.drop_duplicates(subset=["s1_entity_id", "cand_id"])
-            del pk
         yield base
 
 

@@ -194,6 +194,29 @@ def run(cfg: dict, force: bool = False) -> dict:
         kept_p = np.concatenate(kept_p)
         winner_t = _competition_indices(kept_p1, kept_p2, kept_p, len(t_cand_ids))
         cand_final = np.where(winner_t >= 0)[0]
+        if len(cand_final) == 0 and cfg["decision"].get("emergency_top1_fallback", True):
+            # Degenerate-model safety net (e.g. tiny train data): per candidate-bearing
+            # entity keep its single best p_cal. Loudly flagged; never normal policy.
+            print("WARNING: threshold filter kept 0 test pairs — using emergency per-entity top-1 fallback")
+            fallback_rows = []
+            for sp in sorted(test_scores_dir.glob("shard_*.parquet")):
+                df = pd.read_parquet(sp)
+                p1t = df["s1_idx"].to_numpy()
+                p2t = df["cand_idx"].to_numpy()
+                pt = iso.predict(df["p_match"].to_numpy()).astype(np.float32)
+                order = np.argsort(-pt)
+                seen: set[int] = set()
+                for i in order:
+                    e = int(p1t[i])
+                    if e in seen:
+                        continue
+                    seen.add(e)
+                    fallback_rows.append((e, int(p2t[i])))
+                del df
+            fr = np.array(fallback_rows, dtype=np.int64)
+            winner_t = np.full(len(t_cand_ids), -1, dtype=np.int64)
+            winner_t[fr[:, 1]] = fr[:, 0]
+            cand_final = np.where(winner_t >= 0)[0]
         preds = pd.DataFrame({
             "s1_entity_id": t_s1_ids[winner_t[cand_final]],
             "cand_id": t_cand_ids[cand_final],
