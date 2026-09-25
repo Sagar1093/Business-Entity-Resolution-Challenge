@@ -92,6 +92,17 @@ def run(cfg: dict, force: bool = False) -> dict:
         val = merged
         print(f"  rerank blend applied to {int(band.sum()):,} val pairs (w={w})")
 
+    llm_path = art / "features" / "train_llm.parquet"
+    if llm_path.exists():
+        llm = pd.read_parquet(llm_path)
+        val = val.merge(llm, on=["s1_entity_id", "cand_id"], how="left")
+        wl = float(cfg["decision"].get("llm_blend_w", 0.3))
+        has_llm = val["llm_yes"].notna()
+        val.loc[has_llm, "p_cal"] = (
+            (1 - wl) * val.loc[has_llm, "p_cal"] + wl * val.loc[has_llm, "llm_yes"]
+        ).astype(np.float32)
+        print(f"  LLM blend applied to {int(has_llm.sum()):,} val pairs (w={wl})")
+
     lo, hi, step = cfg["decision"]["threshold_grid"]
     grid = np.arange(lo, hi + 1e-9, step)
     # apply the SAME candidate-competition policy used at test time, then sweep
@@ -133,6 +144,15 @@ def run(cfg: dict, force: bool = False) -> dict:
             band = test["rerank_score"].notna()
             test.loc[band, "p_cal"] = (
                 (1 - w) * test.loc[band, "p_cal"] + w * (test.loc[band, "rerank_score"] > 0).astype(np.float32)
+            ).astype(np.float32)
+        llm_t = art / "features" / "test_llm.parquet"
+        if llm_t.exists():
+            llm = pd.read_parquet(llm_t)
+            test = test.merge(llm, on=["s1_entity_id", "cand_id"], how="left")
+            wl = float(cfg["decision"].get("llm_blend_w", 0.3))
+            has_llm = test["llm_yes"].notna()
+            test.loc[has_llm, "p_cal"] = (
+                (1 - wl) * test.loc[has_llm, "p_cal"] + wl * test.loc[has_llm, "llm_yes"]
             ).astype(np.float32)
         s1_country_test = _load_test_countries(cfg)
         test_kept, n_dropped = _apply_country_thresholds(test, thresholds, s1_country_test)
