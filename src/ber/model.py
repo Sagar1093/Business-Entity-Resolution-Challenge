@@ -145,7 +145,10 @@ def run(cfg: dict, force: bool = False) -> dict:
     io_utils.json_dump(eval_, art / "model_eval.json")
     _write_model_card(eval_, Path(cfg["paths"]["reports_dir"]) / "model_card.md")
 
-    # ---- test inference ----
+    # ---- test inference (independently resumable) ----
+    if not force and test_scores_path.exists():
+        print("test scores fresh — skipping test inference")
+        return eval_
     print("scoring test pairs...", flush=True)
     del X_tr, X_va, dtrain, dval  # free train/val matrices before test scoring
     import gc
