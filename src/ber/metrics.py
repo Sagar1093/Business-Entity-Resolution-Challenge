@@ -34,15 +34,17 @@ def entity_f05(pred: dict[str, set[str]], truth: dict[str, set[str]],
     singleton_correct = 0
     for s1, true_set in truth.items():
         pred_set = pred.get(s1, set())
-        tp = len(pred_set & true_set)
-        fp = len(pred_set - true_set)
-        fn = len(true_set - pred_set)
-        prec = tp / (tp + fp) if (tp + fp) else 0.0
-        rec = tp / (tp + fn) if (tp + fn) else 0.0
-        if prec + rec:
-            f = 1.25 * prec * rec / (0.25 * prec + rec)
+        if not true_set:
+            # Singleton rule (README): correct empty prediction = 1.0, any
+            # predicted match = 0.0. Must be checked BEFORE prec/rec (0/0).
+            f = 1.0 if not pred_set else 0.0
         else:
-            f = 0.0
+            tp = len(pred_set & true_set)
+            fp = len(pred_set - true_set)
+            fn = len(true_set - pred_set)
+            prec = tp / (tp + fp) if (tp + fp) else 0.0
+            rec = tp / (tp + fn) if (tp + fn) else 0.0
+            f = (1.25 * prec * rec / (0.25 * prec + rec)) if (prec + rec) else 0.0
         f05s.append(f)
         if per_country:
             by_country[per_country.get(s1, "<none>")].append(f)
