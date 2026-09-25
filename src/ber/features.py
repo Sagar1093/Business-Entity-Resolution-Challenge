@@ -24,6 +24,7 @@ import pandas as pd
 from rapidfuzz import distance, process
 
 from . import io_utils
+from .blocking import iter_candidate_shards
 
 DIGITS_RE = re.compile(r"\d+")
 
@@ -195,10 +196,6 @@ def compute_chunk(A: SideArrays, B: SideArrays, p1: np.ndarray, p2: np.ndarray,
     return out
 
 
-def _iter_pairs_sharded(cand_path: Path, chunk_rows: int):
-    yield from io_utils.iter_parquet_chunks(cand_path, chunk_rows)
-
-
 def run(cfg: dict, force: bool = False) -> dict:
     art = Path(cfg["paths"]["artifacts_dir"])
     nrm, blk = art / "normalized", art / "blocking"
@@ -206,8 +203,9 @@ def run(cfg: dict, force: bool = False) -> dict:
     for split in ("train", "test"):
         out_dir = art / "features" / f"{split}_pairs"
         meta_path = art / "features" / f"{split}_pairs.meta.json"
+        cand_dir = blk / f"{split}_candidates"
         inputs = {
-            "cand": blk / f"{split}_candidates.parquet",
+            "cand_dir": str(cand_dir),
             "s1": nrm / f"{split}_s1.parquet",
             "s2": nrm / f"{split}_s2.parquet",
             "s3": nrm / f"{split}_s3.parquet",
@@ -238,7 +236,7 @@ def run(cfg: dict, force: bool = False) -> dict:
 
         CH = 5_000_000
         shard, shard_id, total = [], 0, 0
-        for it, chunk in enumerate(_iter_pairs_sharded(blk / f"{split}_candidates.parquet", CH)):
+        for it, chunk in enumerate(iter_candidate_shards(split, cfg)):
             p1 = A.index.get_indexer(chunk["s1_entity_id"].to_numpy())
             p2 = B.index.get_indexer(chunk["cand_id"].to_numpy())
             if (p1 < 0).any() or (p2 < 0).any():

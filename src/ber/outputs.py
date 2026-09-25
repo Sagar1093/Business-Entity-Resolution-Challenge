@@ -42,7 +42,7 @@ def run(cfg: dict, force: bool = False) -> dict:
     art = Path(cfg["paths"]["artifacts_dir"])
     out_dir = Path(cfg["paths"]["output_dir"])
     preds_path = art / "features" / "test_predictions.parquet"
-    cand_path = art / "blocking" / "test_candidates.parquet"
+    cand_dir = art / "blocking" / "test_candidates"
     if not preds_path.exists():
         raise SystemExit("S8 requires test_predictions.parquet (run S7 first)")
 
@@ -54,7 +54,12 @@ def run(cfg: dict, force: bool = False) -> dict:
         required.extend(df["entity_id"].tolist())
 
     preds = pd.read_parquet(preds_path)
-    cand = pd.read_parquet(cand_path)
+    cand_dir = art / "blocking" / "test_candidates"
+    cand_parts = []
+    for shard in sorted(cand_dir.glob("shard_*.parquet")):
+        cand_parts.append(pd.read_parquet(shard, columns=["s1_entity_id", "cand_id"]))
+    cand = pd.concat(cand_parts, ignore_index=True)
+    del cand_parts
     matching = _group(preds, "cand_id")
     candidates = _group(cand, "cand_id")
 
