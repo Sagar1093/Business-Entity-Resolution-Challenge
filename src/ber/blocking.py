@@ -274,10 +274,26 @@ def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, in
 
 
 def iter_candidate_shards(split: str, cfg: dict):
-    """Yield candidate DataFrames shard-by-shard (features/outputs consume this)."""
+    """Yield UNIONED+DEDUPED candidate DataFrames shard-by-shard.
+
+    Merges the base shards with the slice-aligned G (trigram) shards when
+    present; dedup via packed int64 keys. Consumed by features/outputs.
+    """
     out_dir = Path(cfg["paths"]["artifacts_dir"]) / "blocking" / f"{split}_candidates"
+    g_dir = Path(cfg["paths"]["artifacts_dir"]) / "blocking" / f"{split}_candidates_g"
+    g_files = {p.name: p for p in sorted(g_dir.glob("shard_*.parquet"))} if g_dir.exists() else {}
     for p in sorted(out_dir.glob("shard_*.parquet")):
-        yield pd.read_parquet(p)
+        base = pd.read_parquet(p)
+        g = g_files.get(p.name)
+        if g is not None:
+            base = pd.concat([base, pd.read_parquet(g, columns=["s1_entity_id", "cand_id"])],
+                             ignore_index=True)
+            pk = base["s1_entity_id"].to_numpy().astype(np.int64) << np.int64(32) | \
+                pd.factorize(base["cand_id"])[0].astype(np.int64)
+            # factorize ids differ per shard -> dedup on string pair instead:
+            base = base.drop_duplicates(subset=["s1_entity_id", "cand_id"])
+            del pk
+        yield base
 
 
 def run(cfg: dict, force: bool = False) -> dict:
