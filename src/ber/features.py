@@ -196,10 +196,21 @@ def compute_chunk(A: SideArrays, B: SideArrays, p1: np.ndarray, p2: np.ndarray,
     return out
 
 
+def _free_disk_gb(path: Path) -> float:
+    import shutil
+
+    return shutil.disk_usage(str(path)).free / 2**30
+
+
 def run(cfg: dict, force: bool = False) -> dict:
     art = Path(cfg["paths"]["artifacts_dir"])
     nrm, blk = art / "normalized", art / "blocking"
     out_all = {}
+    if _free_disk_gb(art) < 15.0:
+        raise SystemExit(
+            f"S4 aborted: only {_free_disk_gb(art):.1f} GB free (need >= 15 GB). "
+            "Free disk space before building features."
+        )
     for split in ("train", "test"):
         out_dir = art / "features" / f"{split}_pairs"
         meta_path = art / "features" / f"{split}_pairs.meta.json"
