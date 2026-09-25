@@ -121,33 +121,39 @@ def _cap_per_s1(pairs: np.ndarray) -> tuple[np.ndarray, int]:
     return p[keep], n_capped
 
 
-def _trigram_rescue(s1c: pd.DataFrame, s23c: pd.DataFrame, uncovered: np.ndarray,
-                    stats_counter: dict) -> np.ndarray:
-    """Top-K trigram neighbors for uncovered S1 rows in this slice."""
+def build_trigram_index(s23c: pd.DataFrame) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Country-level inverted index: gram -> int32 postings array (built ONCE per country)."""
+    inv: dict[str, list[int]] = defaultdict(list)
+    for i, nm in enumerate(s23c["name_norm"].to_numpy()):
+        for tg in _char_trigrams(nm):
+            inv[tg].append(i)
+    return {k: np.asarray(v, dtype=np.int32) for k, v in inv.items()}, s23c.index.to_numpy(dtype=np.int32)
+
+
+def _trigram_rescue(s1c: pd.DataFrame, index: tuple[dict[str, np.ndarray], np.ndarray],
+                    uncovered: np.ndarray, stats_counter: dict) -> np.ndarray:
+    """Top-K trigram neighbors for uncovered S1 rows using the prebuilt index.
+    Vectorized scoring via postings concatenation + np.unique/np.bincount."""
+    postings, _ = index
     idxs = np.where(uncovered)[0]
     if not len(idxs):
         return np.empty((0, 2), dtype=np.int32)
-    inv: dict[str, list[int]] = defaultdict(list)
-    s23_norm = s23c["name_norm"].to_numpy()
-    for i, nm in enumerate(s23_norm):
-        for tg in _char_trigrams(nm):
-            inv[tg].append(i)
     out_rows: list[int] = []
     out_vals: list[int] = []
+    norms = s1c["name_norm"].to_numpy()
     for pos in idxs:
-        grams = _char_trigrams(s1c["name_norm"].iat[pos])
+        grams = set(_char_trigrams(norms[pos]))
+        grams = [g for g in grams if g in postings]
         if not grams:
             continue
-        scores: dict[int, int] = defaultdict(int)
-        for tg in set(grams):
-            for i in inv.get(tg, ()):
-                scores[i] += 1
-        if not scores:
-            continue
-        top = sorted(scores.items(), key=lambda kv: -kv[1])[:TRIGRAM_TOPK]
-        out_rows.extend([int(pos)] * len(top))
-        out_vals.extend(i for i, _ in top)
-        stats_counter["F_trigram"] = stats_counter.get("F_trigram", 0) + len(top)
+        cand_arr = np.concatenate([postings[g] for g in grams])
+        uniq, counts = np.unique(cand_arr, return_counts=True)
+        if len(uniq) > TRIGRAM_TOPK:
+            top_idx = np.argpartition(-counts, TRIGRAM_TOPK)[:TRIGRAM_TOPK]
+            uniq = uniq[top_idx]
+        out_rows.extend([int(pos)] * len(uniq))
+        out_vals.extend(int(i) for i in uniq)
+        stats_counter["F_trigram"] = stats_counter.get("F_trigram", 0) + len(uniq)
     if not out_rows:
         return np.empty((0, 2), dtype=np.int32)
     return np.column_stack([np.asarray(out_rows, dtype=np.int32),
@@ -184,7 +190,7 @@ def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, in
         s1_pos_global = np.where(c_s1_mask)[0]
         s1_ids_c = s1_full["entity_id"].to_numpy()[c_s1_mask]
 
-        # precompute strategy blocks once per country (memory: indices only)
+        # precompute strategy blocks + trigram index ONCE per country
         blocks = {
             "A": _blocks(s23c_full, "name_bag"),
             "B": _blocks(s23c_full, "bag_nod"),
@@ -192,6 +198,7 @@ def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, in
             "E": _blocks(s23c_full, "ph2"),
             "D": _blocks(s23c_full, "addr_postal"),
         }
+        tri_index = build_trigram_index(s23c_full) if cfg["blocking"]["strategies"]["tfidf_lsh"] else None
         print(f"  [{split}] {country}: S1={len(s1_ids_c):,} S23={len(s23c_full):,} — processing slices...", flush=True)
 
         n_slices = (len(s1_ids_c) + SLICE_ROWS - 1) // SLICE_ROWS
@@ -204,11 +211,11 @@ def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, in
                 arr = _emit_exact(s1c, blocks[tag[0]], col, stats, f"{split}.{country}.{tag}")
                 if len(arr):
                     parts.append(arr)
-            if cfg["blocking"]["strategies"]["tfidf_lsh"]:
+            if tri_index is not None:
                 covered = np.zeros(len(s1c), dtype=bool)
                 for arr in parts:
                     covered[arr[:, 0]] = True
-                f = _trigram_rescue(s1c, s23c_full, ~covered, stats)
+                f = _trigram_rescue(s1c, tri_index, ~covered, stats)
                 if len(f):
                     parts.append(f)
             allp = _dedup(np.concatenate(parts)) if parts else np.empty((0, 2), dtype=np.int32)
@@ -227,7 +234,7 @@ def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, in
             if si % 5 == 0:
                 print(f"  [{split}] {country} slice {si + 1}/{n_slices} — cumulative pairs {total_pairs:,}", flush=True)
             del allp, s1c
-        del blocks, s23c_full, s23_pos_global, s1_ids_c, s1_pos_global
+        del blocks, s23c_full, s23_pos_global, s1_ids_c, s1_pos_global, tri_index
 
     final = {
         "pairs_total": int(total_pairs),
