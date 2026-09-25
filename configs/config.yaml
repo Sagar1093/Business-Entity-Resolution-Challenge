@@ -1,0 +1,115 @@
+# Business Entity Resolution pipeline configuration.
+# All stage parameters live here; modules read from this file, never hard-code.
+
+seed: 42
+
+paths:
+  dataset_train_dir: dataset/train
+  dataset_test_dir: dataset/test
+  artifacts_dir: artifacts
+  models_dir: models
+  reports_dir: reports
+  output_dir: output
+  submission_dir: submission
+
+io:
+  chunk_rows: 500_000          # rows per chunk when streaming TSVs
+  parquet_row_group_size: 500_000
+  float_dtype: float32         # features stored fp32 (fp16 not worth parquet risk)
+
+splits:
+  # Grouped 90/10 holdout by Source 1 entity. NEVER pair-level random.
+  val_fraction: 0.10
+  split_manifest: artifacts/splits/split_manifest.parquet
+
+normalization:
+  # All maps fit from TRAIN only. Applied identically to train and test.
+  learn_from: train
+  min_token_doc_freq: 0.001    # token frequency cutoff when mining suffix/abbrev candidates
+
+blocking:
+  # Country equality is a *pair property* (join on country string equality),
+  # never a hard-coded country list. Any country string works, France included.
+  per_country: true
+  candidate_cap_per_s1: 1000   # per-S1 union cap; audited for recall on val
+  recall_gate_pair: 0.999      # blocking audit gates (measured on val split)
+  recall_gate_entity: 0.995
+  strategies:
+    name_bag_exact: true
+    phonetic: true
+    tfidf_lsh: true             # char 3-4gram + word, MinHashLSH top-K
+    numeric_keys: true          # postal / house-number digit runs
+    supervised_bootstrap: true  # train-only mining of extra keys via tiny LGBM
+    wide_fallback: true         # empty/short-field entities get widest key
+  lsh:
+    num_perm: 128
+    top_k: 100
+  faiss:
+    index_type: ivf_flat
+    top_k: 100
+
+features:
+  tfidf:
+    name_analyzers: [char_wb_3_4, word]
+    address_analyzers: [char_wb_3_4, word]
+    min_df: 3
+  embeddings:
+    model: BAAI/bge-m3
+    fp16: true
+    name_max_len: 64
+    full_max_len: 256
+    cache_dir: artifacts/embeddings
+
+model:
+  type: lightgbm
+  params:
+    objective: binary
+    learning_rate: 0.05
+    num_leaves: 127
+    feature_fraction: 0.85
+    bagging_fraction: 0.85
+    bagging_freq: 1
+    min_data_in_leaf: 200
+    num_threads: 0              # all cores
+  early_stopping_rounds: 200
+  num_boost_round: 3000
+  baseline: logistic_regression
+
+rerank:
+  model: BAAI/bge-reranker-v2-m3
+  fp16: true
+  band_low: 0.15               # difficult band on model probability
+  band_high: 0.90
+  max_len: 256
+  batch_size: 256
+  cache: artifacts/cache/rerank_scores
+
+llm_adjudicate:
+  model: Qwen/Qwen2.5-7B-Instruct
+  expected_params_max_b: 8.0   # challenge constraint: <= 8B
+  required_license: apache-2.0
+  load_in_4bit: true
+  band_low: 0.45
+  band_high: 0.75
+  max_pairs_fraction: 0.04     # hard cap on share of pairs sent to LLM
+  temperature: 0.0
+  max_new_tokens: 8
+  cache: artifacts/cache/llm_scores
+
+decision:
+  # Calibration on grouped val split only. Country thresholds are learned
+  # ONLY for countries represented in the training split; every other country
+  # string falls back to the global threshold. Never fit on test/France.
+  calibrators: isotonic        # isotonic | platt
+  threshold_grid: [0.05, 0.95, 0.0025]
+  singleton_max_prob: tune     # tuned on val
+  ovr_boost: tune              # tuned on val
+  singleton_rate_tolerance_pp: 3.0
+  thresholds_out: artifacts/calibration/thresholds.json
+
+validation:
+  run_official_validator: true
+  check_ids_if_memory_allows: true   # diagnostic only, never a gate
+
+labels:
+  positive_class: 1

@@ -1,0 +1,33 @@
+# Core data / numerics
+pandas==2.2.3
+numpy==2.1.3
+pyarrow==18.1.0
+pyyaml==6.0.2
+tqdm==4.67.1
+
+# ML
+scikit-learn==1.5.2
+lightgbm==4.5.0
+matplotlib==3.9.2
+
+# Embeddings / transformers
+transformers==4.46.3
+accelerate==1.1.1
+sentencepiece==0.2.0
+FlagEmbedding==1.3.4
+bitsandbytes==0.50.2
+
+# Retrieval / similarity
+faiss-cpu==1.9.0
+datasketch==1.6.4
+rapidfuzz==3.10.1
+jellyfish==1.1.3
+
+# Text normalization
+unidecode==1.3.8
+indic-transliteration==2.3.9
+regex==2024.11.6
+
+# NOTE: torch is installed separately with the CUDA wheel index:
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cu126
+# The PyPI default wheel on Windows is CPU-only.
