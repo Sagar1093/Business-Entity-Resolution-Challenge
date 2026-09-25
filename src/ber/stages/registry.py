@@ -9,6 +9,8 @@ from . import (
     s6_rerank,
     s7_decision,
     s8_outputs,
+    s9_validate,
+    s10_package,
     s_eda,
     s_splits,
 )
@@ -25,4 +27,6 @@ STAGES = {
     "rerank": {"run": s6_rerank.run, "desc": "S6 bge-reranker difficult-band scoring (guarded)"},
     "decision": {"run": s7_decision.run, "desc": "S7 calibration + decision engine (F0.5 thresholds)"},
     "outputs": {"run": s8_outputs.run, "desc": "S8 write matching_results.tsv + candidate_pairs.tsv"},
+    "validate": {"run": s9_validate.run, "desc": "S9 official validator PASS gate (+ optional --check-ids)"},
+    "package": {"run": s10_package.run, "desc": "S10 fill docs + build submission zip"},
 }
