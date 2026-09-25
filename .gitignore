@@ -1,27 +1,48 @@
-# Python
+# --- Python ---
 __pycache__/
 *.py[cod]
+*$py.class
 .venv/
+venv/
 *.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
 
-# Large data & stage artifacts (never commit; regenerable by pipeline)
+# --- Challenge data (never commit: multi-GB, redistributing is prohibited) ---
 dataset/
+*.tsv
+!reports/*.tsv
+
+# --- Regenerable stage artifacts (parquet/embeddings/indexes/checkpoints) ---
 artifacts/
 models/
 output/
 submission/
 *.parquet
-*.tsv
-!reports/*.md
+*.npy
+*.npz
+*.faiss
+*.bin
 
-# Logs & temp
+# --- Logs & temp ---
 *.log
-/tmp/
 logs/
+/tmp/
 
-# OS / editor
+# --- Editors / OS ---
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
+desktop.ini
 .freebuff/
 
-# Reports ARE tracked (small .md files documenting stage audits)
+# --- Notebooks ---
+.ipynb_checkpoints/
+
+# Keep methodology + audit reports in git (small markdown)
+!reports/*.md
