@@ -1,10 +1,14 @@
-"""S5 — LightGBM pair classifier.
+"""S5 — LightGBM pair classifier (index-based streaming; full implementation).
 
-Label: pair positive iff cand_id is in that S1 entity's GT match list (train only).
-Split discipline: features from split=='train_models' entities train the model;
-split=='val' entities drive early stopping, calibration and metrics — never training.
-Test features are used only for inference. Outputs: models/lgbm_pair.txt,
-artifacts/model_eval.json, reports/model_card.md, val/test pair scores.
+Data flow (train):
+  pass A: stream candidate index shards -> labels via packed GT lookup;
+          count pos/neg per shard; per-shard seeded choice of
+          neg_ratio*n_pos negatives (deterministic, resumable).
+  pass B: featurize ONLY selected rows (positives + sampled negatives)
+          plus ALL val-entity rows (unbiased calibration set).
+  train LightGBM w/ early stopping on val; LR baseline; save model.
+Val scoring -> artifacts/features/val_scores.parquet (s1_idx, cand_idx, p_match)
+Test scoring -> artifacts/features/test_scores/shard_* (same columns)
 """
 from __future__ import annotations
 
@@ -14,174 +18,215 @@ import numpy as np
 import pandas as pd
 
 from . import io_utils, metrics
+from .blocking import iter_candidate_shards
+from .features import (FEATURES, SideArrays, compute_features, _NAME_COLS, _ADDR_COLS)
+
+PACK_MUL = 10_500_000  # > max cand index (10.3M)
 
 
-def _labels_for_pairs(pairs: pd.DataFrame, truth: dict[str, set[str]]) -> np.ndarray:
-    """1.0 iff (s1_entity_id, cand_id) is a GT pair. Vectorized via exploded GT."""
-    s1col = pairs["s1_entity_id"].to_numpy()
-    ccol = pairs["cand_id"].to_numpy()
-    y = np.zeros(len(pairs), dtype=np.int8)
-    truth_restricted = {k: v for k, v in truth.items() if k in set(np.unique(s1col))} if len(pairs) > 4_000_000 else truth
-    for i in range(len(pairs)):
-        t = truth_restricted.get(s1col[i])
-        if t and ccol[i] in t:
-            y[i] = 1
-    return y
+def _pack(p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
+    return p1.astype(np.int64) * PACK_MUL + p2.astype(np.int64)
 
 
-def _labels_fast(pairs: pd.DataFrame, truth: dict[str, set[str]]) -> np.ndarray:
-    """Explode GT into a set of (s1, cand) tuples for O(1) membership via merge."""
-    gt_rows = [(s1, m) for s1, ms in truth.items() for m in ms]
-    if not gt_rows:
-        return np.zeros(len(pairs), dtype=np.int8)
-    gt = pd.DataFrame(gt_rows, columns=["s1_entity_id", "cand_id"]).drop_duplicates()
-    merged = pairs[["s1_entity_id", "cand_id"]].merge(gt, on=["s1_entity_id", "cand_id"], how="left", indicator=True)
-    return (merged["_merge"] == "both").to_numpy(dtype=np.int8)
+def _labels_for(p1: np.ndarray, p2: np.ndarray, gt_packed_sorted: np.ndarray) -> np.ndarray:
+    packed = _pack(p1, p2)
+    pos = np.searchsorted(gt_packed_sorted, packed)
+    pos[pos >= len(gt_packed_sorted)] = 0
+    return (gt_packed_sorted[pos] == packed).astype(np.int8)
 
 
-def load_split_pairs(cfg: dict, split: str, feat_dir: Path) -> pd.DataFrame:
-    """Concatenate shards, restricted to a split's S1 entities (via manifest)."""
-    parts = []
-    ids = None
-    if split in ("train_models", "val"):
-        manifest = pd.read_parquet(cfg["splits"]["split_manifest"])
-        ids = set(manifest.loc[manifest["split"] == split, "s1_entity_id"])
-    for shard in sorted(feat_dir.glob("shard_*.parquet")):
-        df = pd.read_parquet(shard)
-        if ids is not None:
-            df = df[df["s1_entity_id"].isin(ids)]
-        parts.append(df)
-    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+def _gt_packed_sorted(cfg: dict, s1_ids: np.ndarray, cand_ids: np.ndarray,
+                      restrict_s1: set[str]) -> np.ndarray:
+    truth = metrics.gt_dict(cfg)
+    truth = {k: v for k, v in truth.items() if k in restrict_s1}
+    rows = [(s1, m) for s1, ms in truth.items() for m in ms]
+    if not rows:
+        return np.empty(0, dtype=np.int64)
+    gt = pd.DataFrame(rows, columns=["s1", "c"]).drop_duplicates()
+    i1 = gt["s1"].map(pd.Series(np.arange(len(s1_ids)), index=s1_ids))
+    i2 = gt["c"].map(pd.Series(np.arange(len(cand_ids)), index=cand_ids))
+    ok = i1.notna() & i2.notna()
+    packed = _pack(i1[ok].to_numpy(dtype=np.int64), i2[ok].to_numpy(dtype=np.int64))
+    return np.sort(np.unique(packed))
+
+
+def _load_side_arrays(nrm: Path, split: str):
+    cols = ["entity_id", "country", *_NAME_COLS, *_ADDR_COLS]
+    s1 = pd.read_parquet(nrm / f"{split}_s1.parquet", columns=cols)
+    s2 = pd.read_parquet(nrm / f"{split}_s2.parquet", columns=cols)
+    s3 = pd.read_parquet(nrm / f"{split}_s3.parquet", columns=cols)
+    n_s3 = len(s3)
+    s23 = pd.concat([s2, s3], ignore_index=True)
+    del s2, s3
+    A, B = SideArrays(s1), SideArrays(s23)
+    is_s3 = np.zeros(len(s23), dtype=bool)
+    is_s3[len(s23) - n_s3:] = True
+    return A, B, is_s3
+
+
+def _index_shards_exist(cfg: dict, split: str) -> bool:
+    d = Path(cfg["paths"]["artifacts_dir"]) / "features" / f"{split}_pairs"
+    return (d / "s1_ids.parquet").exists() and any(d.glob("shard_*.parquet"))
 
 
 def run(cfg: dict, force: bool = False) -> dict:
     art = Path(cfg["paths"]["artifacts_dir"])
     models_dir = Path(cfg["paths"]["models_dir"])
-    feat_train = art / "features" / "train_pairs"
     model_path = models_dir / "lgbm_pair.txt"
     val_scores_path = art / "features" / "val_scores.parquet"
-    test_scores_path = art / "features" / "test_scores.parquet"
-    params_key = {"model": cfg["model"], "v": 1}
-
-    if not force and model_path.exists() and val_scores_path.exists():
-        print("S5 model + val scores fresh — skipping")
-        eval_ = io_utils.json_load(art / "model_eval.json")
-        return eval_
+    test_scores_dir = art / "features" / "test_scores"
+    if not force and model_path.exists() and val_scores_path.exists() and test_scores_dir.exists():
+        print("S5 fresh — skipping")
+        return io_utils.json_load(art / "model_eval.json")
 
     import lightgbm as lgb
 
-    print("loading train_models features...", flush=True)
-    tr = load_split_pairs(cfg, "train_models", feat_train)
-    print(f"  train_models pairs: {len(tr):,}")
-    truth_all = metrics.gt_dict(cfg)
-    y_tr = _labels_fast(tr, truth_all)
-    print(f"  positives: {int(y_tr.sum()):,} ({y_tr.mean():.4%})")
-    feat_cols = [c for c in tr.columns if c not in ("s1_entity_id", "cand_id")]
-    X_tr = tr[feat_cols].to_numpy(dtype=np.float32)
-    del tr  # free the key+frame copy before val loads (peak-RAM control)
+    feat_dir = art / "features" / "train_pairs"
+    s1_ids = pd.read_parquet(feat_dir / "s1_ids.parquet")["entity_id"].to_numpy()
+    cand_ids = pd.read_parquet(feat_dir / "cand_ids.parquet")["entity_id"].to_numpy()
+    manifest = pd.read_parquet(cfg["splits"]["split_manifest"])
+    val_ids = set(manifest.loc[manifest["split"] == "val", "s1_entity_id"])
+    train_ids = set(manifest.loc[manifest["split"] == "train_models", "s1_entity_id"])
+    val_row_mask = np.isin(s1_ids, list(val_ids))
 
-    print("loading val features...", flush=True)
-    va = load_split_pairs(cfg, "val", feat_train)
-    y_va = _labels_fast(va, truth_all)
-    X_va = va[feat_cols].to_numpy(dtype=np.float32)
-    print(f"  val pairs: {len(va):,} positives {int(y_va.sum()):,}")
-    va_keys = va[["s1_entity_id", "cand_id"]].copy()
-    del va
+    gt_train = _gt_packed_sorted(cfg, s1_ids, cand_ids, train_ids)
+    gt_val = _gt_packed_sorted(cfg, s1_ids, cand_ids, val_ids)
+    neg_ratio = int(cfg["model"].get("train_neg_ratio", 3))
+    seed = int(cfg["seed"])
+
+    # ---- pass A: labels/counts + per-shard negative selection ----
+    shard_files = sorted((art / "blocking" / "train_candidates").glob("shard_*.parquet"))
+    plan: list[dict] = []
+    tot_pos = tot_neg = 0
+    print("pass A: counting positives/negatives per shard...", flush=True)
+    for si, sp in enumerate(shard_files):
+        cand = pd.read_parquet(sp)
+        p1 = s1_ids.searchsorted(cand["s1_entity_id"].to_numpy())
+        p2 = cand_ids.searchsorted(cand["cand_id"].to_numpy())
+        y = _labels_for(p1, p2, gt_train)
+        is_val = val_row_mask[p1]
+        y_eff = np.where(is_val, 0, y)  # val rows never count as train positives
+        pos_idx = np.where((y == 1) & ~is_val)[0]
+        neg_idx = np.where((y == 0) & ~is_val)[0]
+        rng = np.random.default_rng(seed + si)
+        take = min(len(neg_idx), neg_ratio * len(pos_idx))
+        neg_sel = rng.choice(neg_idx, size=take, replace=False) if take else np.empty(0, np.int64)
+        val_idx = np.where(is_val)[0]
+        plan.append({"shard": si, "pos": pos_idx, "neg": np.sort(neg_sel), "val": val_idx})
+        tot_pos += len(pos_idx)
+        tot_neg += len(neg_sel)
+        print(f"  shard {si + 1}/{len(shard_files)}: pos={len(pos_idx):,} neg_kept={take:,} val={len(val_idx):,}", flush=True)
+        del cand, p1, p2, y
+    print(f"pass A totals: positives={tot_pos:,} negatives_kept={tot_neg:,}", flush=True)
+
+    # ---- pass B: featurize selected rows ----
+    print("pass B: featurizing selected rows...", flush=True)
+    A, B, is_s3_all = _load_side_arrays(art / "normalized", "train")
+    X_parts, y_parts = [], []
+    va_X, va_p1_all, va_p2_all = [], [], []
+    for item in plan:
+        cand = pd.read_parquet(shard_files[item["shard"]])
+        p1 = s1_ids.searchsorted(cand["s1_entity_id"].to_numpy())
+        p2 = cand_ids.searchsorted(cand["cand_id"].to_numpy())
+        del cand
+        sel = np.unique(np.concatenate([item["pos"], item["neg"], item["val"]]))
+        f = compute_features(A, B, p1[sel], p2[sel], is_s3_all[p2[sel]])
+        X = np.stack([f[name] for name in FEATURES], axis=1)
+        del f
+        pos_in_sel = np.isin(sel, item["pos"])
+        val_in_sel = np.isin(sel, item["val"])
+        tr_mask = ~val_in_sel
+        X_parts.append(X[tr_mask])
+        y_parts.append(pos_in_sel[tr_mask].astype(np.int8))
+        va_X.append(X[val_in_sel])
+        va_p1_all.append(p1[sel][val_in_sel])
+        va_p2_all.append(p2[sel][val_in_sel])
+        del X, sel, pos_in_sel, val_in_sel, tr_mask
+        print(f"  featurized shard {item['shard'] + 1}/{len(plan)}", flush=True)
+    X_tr = np.concatenate(X_parts)
+    y_tr = np.concatenate(y_parts)
+    X_va = np.concatenate(va_X)
+    va_p1 = np.concatenate(va_p1_all)
+    va_p2 = np.concatenate(va_p2_all)
+    del X_parts, y_parts, va_X, va_p1_all, va_p2_all, A, B, is_s3_all, plan
+    print(f"train matrix: {X_tr.shape}, val matrix: {X_va.shape}", flush=True)
 
     params = dict(cfg["model"]["params"])
-    params.update({
-        "objective": "binary",
-        "metric": "average_precision",
-        "verbosity": -1,
-        "seed": int(cfg["seed"]),
-        "two_round": True,
-    })
-    dtrain = lgb.Dataset(X_tr, label=y_tr, feature_name=feat_cols, free_raw_data=True)
-    dval = lgb.Dataset(X_va, label=y_va, reference=dtrain, feature_name=feat_cols)
-    booster = lgb.train(
-        params, dtrain, num_boost_round=int(cfg["model"]["num_boost_round"]),
-        valid_sets=[dval], valid_names=["val"],
-        callbacks=[lgb.early_stopping(int(cfg["model"]["early_stopping_rounds"]), verbose=False)],
-    )
+    params.update({"objective": "binary", "metric": "average_precision",
+                   "verbosity": -1, "seed": seed, "two_round": True})
+    dtrain = lgb.Dataset(X_tr, label=y_tr, feature_name=FEATURES, free_raw_data=True)
+    y_va = _labels_for(va_p1, va_p2, gt_val)
+    dval = lgb.Dataset(X_va, label=y_va, reference=dtrain, feature_name=FEATURES)
+    booster = lgb.train(params, dtrain, num_boost_round=int(cfg["model"]["num_boost_round"]),
+                        valid_sets=[dval], valid_names=["val"],
+                        callbacks=[lgb.early_stopping(int(cfg["model"]["early_stopping_rounds"]), verbose=False)])
     booster.save_model(str(model_path))
-    print(f"  best iteration: {booster.best_iteration}")
+    print(f"best iteration: {booster.best_iteration}")
 
-    # logistic baseline
+    # LR baseline on a subsample
     from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import average_precision_score
     from sklearn.preprocessing import StandardScaler
 
-    scaler = StandardScaler().fit(X_tr[::5])
-    lr = LogisticRegression(max_iter=300, n_jobs=-1).fit(scaler.transform(X_tr[::5]), y_tr[::5])
-    from sklearn.metrics import average_precision_score
-
+    idx = rng.choice(len(X_tr), size=min(500_000, len(X_tr)), replace=False)
+    scaler = StandardScaler().fit(X_tr[idx])
+    lr = LogisticRegression(max_iter=300).fit(scaler.transform(X_tr[idx]), y_tr[idx])
     lr_ap = average_precision_score(y_va, lr.predict_proba(scaler.transform(X_va))[:, 1])
+    del X_tr, y_tr, scaler, lr
 
-    va_scored = va_keys
-    va_scored["p_match"] = booster.predict(X_va, num_iteration=booster.best_iteration)
-    va_scored.to_parquet(val_scores_path, index=False)
-    ap = average_precision_score(y_va, va_scored["p_match"])
-    print(f"  val pair AP: lgbm={ap:.5f} lr_baseline={lr_ap:.5f}")
+    p_va = booster.predict(X_va, num_iteration=booster.best_iteration)
+    ap = average_precision_score(y_va, p_va)
+    print(f"val pair AP: lgbm={ap:.5f} lr={lr_ap:.5f}")
+    pd.DataFrame({"s1_idx": va_p1, "cand_idx": va_p2, "p_match": p_va}).to_parquet(
+        val_scores_path, index=False)
+    del X_va, p_va
 
-    imp = sorted(zip(feat_cols, booster.feature_importance("gain").tolist()), key=lambda kv: -kv[1])[:15]
-
-    # ---- val entity-level F0.5 quick sweep (operating point preview; final in S7) ----
-    val_manifest = pd.read_parquet(cfg["splits"]["split_manifest"])
-    val_ids = set(val_manifest.loc[val_manifest["split"] == "val", "s1_entity_id"])
-    country = dict(zip(val_manifest["s1_entity_id"], val_manifest["country"]))
-    truth_val = {k: v for k, v in truth_all.items() if k in val_ids}
-    sweep = []
-    for th in (0.3, 0.5, 0.7, 0.8, 0.9):
-        pred = metrics.predictions_at_threshold(va_scored, th)
-        m = metrics.entity_f05(pred, truth_val, per_country=country)
-        sweep.append({"threshold": th, **m})
-    best = max(sweep, key=lambda m: m["macro_f05"])
-
-    eval_ = {
-        "val_pair_ap": ap, "lr_baseline_ap": lr_ap,
-        "best_iteration": booster.best_iteration,
-        "feature_importance": imp,
-        "val_f05_sweep": sweep, "best_val_operating": best,
-    }
+    imp = sorted(zip(FEATURES, booster.feature_importance("gain").tolist()), key=lambda kv: -kv[1])[:15]
+    eval_ = {"val_pair_ap": float(ap), "lr_baseline_ap": float(lr_ap),
+             "best_iteration": int(booster.best_iteration),
+             "n_train_rows": int(tot_pos + tot_neg), "n_positives": int(tot_pos),
+             "feature_importance": imp}
     io_utils.json_dump(eval_, art / "model_eval.json")
     _write_model_card(eval_, Path(cfg["paths"]["reports_dir"]) / "model_card.md")
 
-    # ---- test inference (independently resumable) ----
-    if not force and test_scores_path.exists():
-        print("test scores fresh — skipping test inference")
+    # ---- test scoring (streaming, independently resumable) ----
+    if test_scores_dir.exists() and any(test_scores_dir.glob("shard_*.parquet")):
+        print("test scores fresh — skipping")
         return eval_
-    print("scoring test pairs...", flush=True)
-    del X_tr, X_va, dtrain, dval  # free train/val matrices before test scoring
-    import gc
-    gc.collect()
-    te = load_split_pairs(cfg, "test", art / "features" / "test_pairs")
-    X_te = te[feat_cols].to_numpy(dtype=np.float32)
-    te_keys = te[["s1_entity_id", "cand_id"]].copy()
-    del te
-    te_scored = te_keys
-    te_scored["p_match"] = booster.predict(X_te, num_iteration=booster.best_iteration)
-    te_scored.to_parquet(test_scores_path, index=False)
-    print(f"  test pairs scored: {len(te_scored):,}")
-    del X_te
+    test_scores_dir.mkdir(parents=True, exist_ok=True)
+    t_s1_ids = pd.read_parquet(art / "features" / "test_pairs" / "s1_ids.parquet")["entity_id"].to_numpy()
+    t_cand_ids = pd.read_parquet(art / "features" / "test_pairs" / "cand_ids.parquet")["entity_id"].to_numpy()
+    tA, tB, t_is_s3 = _load_side_arrays(art / "normalized", "test")
+    total = 0
+    for si, chunk in enumerate(iter_candidate_shards("test", cfg)):
+        p1 = tA.index.get_indexer(chunk["s1_entity_id"].to_numpy())
+        p2 = tB.index.get_indexer(chunk["cand_id"].to_numpy())
+        assert (p1 >= 0).all() and (p2 >= 0).all()
+        f = compute_features(tA, tB, p1, p2, t_is_s3[p2])
+        X = np.stack([f[name] for name in FEATURES], axis=1)
+        del f
+        p = np.empty(len(X), dtype=np.float32)
+        step = 5_000_000
+        for lo in range(0, len(X), step):
+            p[lo:lo + step] = booster.predict(X[lo:lo + step], num_iteration=booster.best_iteration)
+        io_utils.write_parquet(pd.DataFrame({"s1_idx": p1, "cand_idx": p2, "p_match": p}),
+                               test_scores_dir / f"shard_{si}.parquet", 1_000_000)
+        total += len(p)
+        print(f"  scored test shard {si + 1}: cumulative {total:,}", flush=True)
+        del X, p
+    print(f"test scoring done: {total:,} pairs")
     return eval_
 
 
 def _write_model_card(ev: dict, out: Path) -> None:
     lines = [
         "# Model card — LightGBM pair classifier", "",
-        f"- val pair average precision: **{ev['val_pair_ap']:.5f}** "
-        f"(logistic baseline {ev['lr_baseline_ap']:.5f})",
+        f"- val pair average precision: **{ev['val_pair_ap']:.5f}** (logistic baseline {ev['lr_baseline_ap']:.5f})",
         f"- best iteration: {ev['best_iteration']}",
+        f"- training rows: {ev['n_train_rows']:,} (positives {ev['n_positives']:,})",
         "",
         "## Top features (gain)",
         "\n".join(f"- `{k}`: {v:,.0f}" for k, v in ev["feature_importance"]),
         "",
-        "## Validation entity-level macro F0.5 sweep (preview; final in S7)",
-        "| threshold | macro F0.5 | singleton acc |",
-        "|---|---|---|",
     ]
-    for s in ev["val_f05_sweep"]:
-        lines.append(f"| {s['threshold']} | {s['macro_f05']:.5f} | {s['singleton_accuracy']:.3f} |")
-    b = ev["best_val_operating"]
-    lines += ["", f"Best preview operating point: threshold {b['threshold']} -> "
-              f"macro F0.5 **{b['macro_f05']:.5f}** (by country: {b.get('by_country', {})})", ""]
     out.write_text("\n".join(lines), encoding="utf-8")

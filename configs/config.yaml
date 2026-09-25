@@ -62,6 +62,8 @@ features:
 
 model:
   type: lightgbm
+  train_neg_ratio: 3            # negatives kept per positive (index-based training)
+  train_pair_budget: 80000000   # informational cap for the sampling plan
   params:
     objective: binary
     learning_rate: 0.05

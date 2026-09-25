@@ -1,18 +1,16 @@
-"""S4 — Pair feature engineering over candidate pairs (vectorized, sharded).
+"""S4 — Pair features as int8-quantized bytes folded into index-based candidate shards.
 
-Features per (s1, cand) pair (all open-set; no country branching):
-  name:  token jaccard/containment/dice, exact bag, char-3gram jaccard/dice,
-         normalized lev ratio, jaro-winkler, token-set diff counts,
-         phonetic equality, initials match, len ratio, tok-count diff
-  addr:  token jaccard/containment, char-3gram jaccard, lev, postal eq/both-empty,
-         digit-run jaccard, landmark co-flag, parts overlap, len ratio, empty flag
-  cross: country equality (learned feature), is_s3 source flag, combined lev
+Why: 312M train + ~200M test pairs x 28 features x fp32 = ~57 GB of parquet
+(impossible with ~26 GB free). Instead each candidate shard is re-emitted with
+int32 index columns (s1_idx, cand_idx) and 28 feature columns stored as
+uint8-quantized bytes (scale 1/255): 28 B/pair -> ~8.7 GB train, ~5.7 GB test.
 
-Design: precompute per-record token/gram frozensets once per split (positional
-arrays); per 5M-pair chunk gather rows via index->position mapping; compute with
-numpy + rapidfuzz.process.cpdist; write rolling shards
-artifacts/features/{split}_pairs/shard_*.parquet (pd.read_parquet reads the
-directory transparently later).
+Layout per shard parquet (artifacts/features/{split}_pairs/shard_*.parquet):
+  s1_idx int32, cand_idx int32, f0..f27 uint8
+Decode: np.frombuffer(row bytes).reshape(n, 28).astype(np.float32) / 255.0
+(see decode_shard / iter_feature_shards below)
+
+Feature order is fixed by FEATURES; side arrays are built once per split.
 """
 from __future__ import annotations
 
@@ -37,6 +35,8 @@ FEATURES = [
     "a_parts_overlap", "a_len_ratio", "a_empty",
     "x_country_eq", "x_is_s3", "x_combined_lev",
 ]
+# unbounded counts mapped to [0,1] with a cap before quantization
+CAPS = {"n_tok_miss": 10.0, "n_tok_extra": 10.0, "n_tok_n_diff": 10.0}
 
 _NAME_COLS = ["name_norm", "name_core", "name_key_phonetic", "name_tok_n"]
 _ADDR_COLS = ["addr_norm", "addr_postal", "addr_digits", "addr_parts", "addr_landmark"]
@@ -82,8 +82,7 @@ class SideArrays:
         ], dtype=object)
 
 
-def _set_pair_stats(sa: np.ndarray, sb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Vectorized (jaccard, max-containment, dice) over aligned object arrays of frozensets."""
+def _set_pair_stats(sa, sb):
     n = len(sa)
     inter = np.empty(n, dtype=np.float32)
     la = np.fromiter((len(x) for x in sa), dtype=np.float32, count=n)
@@ -98,7 +97,7 @@ def _set_pair_stats(sa: np.ndarray, sb: np.ndarray) -> tuple[np.ndarray, np.ndar
     return jac.astype(np.float32), cont.astype(np.float32), dice.astype(np.float32)
 
 
-def _gram_pair_stats(ga: np.ndarray, gb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _gram_pair_stats(ga, gb):
     n = len(ga)
     inter = np.empty(n, dtype=np.float32)
     la = np.fromiter((len(x) for x in ga), dtype=np.float32, count=n)
@@ -112,17 +111,24 @@ def _gram_pair_stats(ga: np.ndarray, gb: np.ndarray) -> tuple[np.ndarray, np.nda
     return jac.astype(np.float32), dice.astype(np.float32)
 
 
-def _lev_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+def _lev_sim(a, b):
     return process.cpdist(a, b, scorer=distance.Levenshtein.normalized_similarity).astype(np.float32)
 
 
-def _jw_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+def _jw_sim(a, b):
     return process.cpdist(a, b, scorer=distance.JaroWinkler.normalized_similarity).astype(np.float32)
 
 
-def compute_chunk(A: SideArrays, B: SideArrays, p1: np.ndarray, p2: np.ndarray,
-                  is_s3: np.ndarray) -> pd.DataFrame:
-    """All features for aligned position arrays p1 (into A) and p2 (into B)."""
+def _len_ratio(x, y):
+    lx = np.fromiter((len(s) for s in x), dtype=np.float32, count=len(x))
+    ly = np.fromiter((len(s) for s in y), dtype=np.float32, count=len(y))
+    mx = np.maximum(lx, ly)
+    return np.where(mx > 0, np.minimum(lx, ly) / mx, 1.0)
+
+
+def compute_features(A: SideArrays, B: SideArrays, p1: np.ndarray, p2: np.ndarray,
+                     is_s3: np.ndarray) -> dict[str, np.ndarray]:
+    """All 28 features for aligned position arrays p1 (A side) / p2 (B side)."""
     n_tok_jac, n_tok_cont, n_tok_dice = _set_pair_stats(A.core_sets[p1], B.core_sets[p2])
     n_c3_jac, n_c3_dice = _gram_pair_stats(A.norm_c3[p1], B.norm_c3[p2])
     a_tok_jac, a_tok_cont, _ = _set_pair_stats(A.addr_sets[p1], B.addr_sets[p2])
@@ -141,25 +147,18 @@ def compute_chunk(A: SideArrays, B: SideArrays, p1: np.ndarray, p2: np.ndarray,
     x_lev = _lev_sim(full_a, full_b)
     x_lev[both_empty & (name_a == "") & (name_b == "")] = 0.0
 
-    def len_ratio(x, y):
-        lx = np.asarray([len(s) for s in x], dtype=np.float32)
-        ly = np.asarray([len(s) for s in y], dtype=np.float32)
-        mx = np.maximum(lx, ly)
-        return np.where(mx > 0, np.minimum(lx, ly) / mx, 1.0)
+    sa, sb = A.core_sets[p1], B.core_sets[p2]
+    n_miss = np.fromiter((len(x - y) for x, y in zip(sa, sb)), dtype=np.float32, count=len(sa))
+    n_extra = np.fromiter((len(y - x) for x, y in zip(sa, sb)), dtype=np.float32, count=len(sa))
 
-    d_a = A.digit_sets[p1]
-    d_b = B.digit_sets[p2]
+    d_a, d_b = A.digit_sets[p1], B.digit_sets[p2]
     dig_inter = np.fromiter((len(x & y) for x, y in zip(d_a, d_b)), dtype=np.float32, count=len(d_a))
     dig_union = np.fromiter((len(x | y) for x, y in zip(d_a, d_b)), dtype=np.float32, count=len(d_a))
     parts_a, parts_b = A.parts_sets[p1], B.parts_sets[p2]
     parts_inter = np.fromiter((len(x & y) for x, y in zip(parts_a, parts_b)), dtype=np.float32, count=len(parts_a))
     parts_min = np.fromiter((min(len(x), len(y)) for x, y in zip(parts_a, parts_b)), dtype=np.float32, count=len(parts_a))
 
-    sa, sb = A.core_sets[p1], B.core_sets[p2]
-    n_miss = np.fromiter((len(x - y) for x, y in zip(sa, sb)), dtype=np.float32, count=len(sa))
-    n_extra = np.fromiter((len(y - x) for x, y in zip(sa, sb)), dtype=np.float32, count=len(sa))
-
-    f = {
+    return {
         "n_tok_jac": n_tok_jac,
         "n_tok_cont": n_tok_cont,
         "n_tok_dice": n_tok_dice,
@@ -173,7 +172,7 @@ def compute_chunk(A: SideArrays, B: SideArrays, p1: np.ndarray, p2: np.ndarray,
         "n_phonetic": ((A.ph[p1] == B.ph[p2]) & (A.ph[p1] != "")).astype(np.float32),
         "n_initials": ((A.initials[p1] == B.initials[p2]) & (A.initials[p1] != "")
                        & (A.name_tok_n[p1] > 1) & (B.name_tok_n[p2] > 1)).astype(np.float32),
-        "n_len_ratio": len_ratio(name_a, name_b),
+        "n_len_ratio": _len_ratio(name_a, name_b),
         "n_tok_n_diff": np.abs(A.name_tok_n[p1] - B.name_tok_n[p2]),
         "a_tok_jac": a_tok_jac,
         "a_tok_cont": a_tok_cont,
@@ -182,18 +181,130 @@ def compute_chunk(A: SideArrays, B: SideArrays, p1: np.ndarray, p2: np.ndarray,
         "a_postal_eq": ((postal_a == postal_b) & (postal_a != "")).astype(np.float32),
         "a_postal_both_empty": ((postal_a == "") & (postal_b == "")).astype(np.float32),
         "a_digits_jac": np.where(dig_union > 0, dig_inter / dig_union, 0.0).astype(np.float32),
-        "a_landmark_both": (A.landmark[p1] * B.landmark[p2]),
+        "a_landmark_both": (A.landmark[p1] * B.landmark[p2]).astype(np.float32),
         "a_parts_overlap": np.where(parts_min > 0, parts_inter / parts_min, 0.0).astype(np.float32),
-        "a_len_ratio": len_ratio(addr_a, addr_b),
+        "a_len_ratio": _len_ratio(addr_a, addr_b),
         "a_empty": (addr_b == "").astype(np.float32),
         "x_country_eq": (A.country[p1] == B.country[p2]).astype(np.float32),
         "x_is_s3": is_s3.astype(np.float32),
         "x_combined_lev": x_lev,
     }
-    out = pd.DataFrame({"s1_entity_id": A.index[p1], "cand_id": B.index[p2]})
-    for k in FEATURES:
-        out[k] = f[k]
+
+
+def _quantize(feats: dict[str, np.ndarray]) -> np.ndarray:
+    """(n, 28) uint8 block in FEATURES order with per-feature caps and 1/255 scale."""
+    cols = []
+    for name in FEATURES:
+        v = feats[name]
+        cap = CAPS.get(name)
+        if cap is not None:
+            v = np.minimum(v, cap) / cap
+        cols.append(np.clip(v, 0.0, 1.0))
+    return (np.stack(cols, axis=1) * 255.0 + 0.5).astype(np.uint8)
+
+
+def decode_shard(df: pd.DataFrame) -> pd.DataFrame:
+    """Quantized shard -> (s1_entity_id, cand_id, 28 float32 features).
+
+    Requires the id-mapping parquets written next to the shards
+    (s1_ids.parquet / cand_ids.parquet per split).
+    """
+    s1_ids = pd.read_parquet(Path(df.attrs["feat_dir"]) / "s1_ids.parquet")["entity_id"].to_numpy()
+    cand_ids = pd.read_parquet(Path(df.attrs["feat_dir"]) / "cand_ids.parquet")["entity_id"].to_numpy()
+    out = pd.DataFrame({
+        "s1_entity_id": s1_ids[df["s1_idx"].to_numpy()],
+        "cand_id": cand_ids[df["cand_idx"].to_numpy()],
+    })
+    q = df[[f"f{i}" for i in range(len(FEATURES))]].to_numpy(dtype=np.uint8)
+    for i, name in enumerate(FEATURES):
+        cap = CAPS.get(name)
+        v = q[:, i].astype(np.float32) / 255.0
+        out[name] = v * cap if cap is not None else v
     return out
+
+
+def _write_id_maps(out_dir: Path, A: SideArrays, B: SideArrays) -> None:
+    pd.DataFrame({"entity_id": A.index.to_numpy()}).to_parquet(out_dir / "s1_ids.parquet", index=False)
+    pd.DataFrame({"entity_id": B.index.to_numpy()}).to_parquet(out_dir / "cand_ids.parquet", index=False)
+
+
+def run(cfg: dict, force: bool = False) -> dict:
+    art = Path(cfg["paths"]["artifacts_dir"])
+    nrm, blk = art / "normalized", art / "blocking"
+    out_all = {}
+    if _free_disk_gb(art) < 15.0:
+        raise SystemExit(f"S4 aborted: only {_free_disk_gb(art):.1f} GB free (need >= 15 GB).")
+
+    for split in ("train", "test"):
+        out_dir = art / "features" / f"{split}_pairs"
+        meta_path = art / "features" / f"{split}_pairs.meta.json"
+        inputs = {
+            "cand_dir": str(blk / f"{split}_candidates"),
+            "s1": nrm / f"{split}_s1.parquet",
+            "s2": nrm / f"{split}_s2.parquet",
+            "s3": nrm / f"{split}_s3.parquet",
+        }
+        params = {"feat_version": 3, "features": FEATURES, "quantization": "uint8/255"}
+        fresh = meta_path.exists() and not force
+        if fresh:
+            print(f"  [{split}] features fresh — skipping")
+            out_all[split] = str(out_dir)
+            continue
+        if meta_path.exists():
+            meta_path.unlink()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for old in out_dir.glob("shard_*.parquet"):
+            old.unlink()
+
+        print(f"  [{split}] building side arrays...", flush=True)
+        s1 = pd.read_parquet(nrm / f"{split}_s1.parquet",
+                             columns=["entity_id", "country", *_NAME_COLS, *_ADDR_COLS])
+        n_s3 = sum(1 for _ in pd.read_parquet(nrm / f"{split}_s3.parquet", columns=["entity_id"])["entity_id"])
+        s2 = pd.read_parquet(nrm / f"{split}_s2.parquet", columns=["entity_id", "country", *_NAME_COLS, *_ADDR_COLS])
+        s3 = pd.read_parquet(nrm / f"{split}_s3.parquet", columns=["entity_id", "country", *_NAME_COLS, *_ADDR_COLS])
+        A = SideArrays(s1)
+        s23 = pd.concat([s2, s3], ignore_index=True)
+        del s2, s3
+        B = SideArrays(s23)
+        is_s3_all = np.zeros(len(s23), dtype=bool)
+        is_s3_all[len(s23) - n_s3:] = True
+        _write_id_maps(out_dir, A, B)
+
+        total, shard_id = 0, 0
+        buf: list[pd.DataFrame] = []
+        buf_rows = 0
+        for chunk in iter_candidate_shards(split, cfg):
+            p1 = A.index.get_indexer(chunk["s1_entity_id"].to_numpy())
+            p2 = B.index.get_indexer(chunk["cand_id"].to_numpy())
+            if (p1 < 0).any() or (p2 < 0).any():
+                raise AssertionError("candidate id missing from normalized frames")
+            feats = compute_features(A, B, p1, p2, is_s3_all[p2])
+            q = _quantize(feats)
+            block = pd.DataFrame({"s1_idx": p1.astype(np.int32), "cand_idx": p2.astype(np.int32)})
+            for i in range(len(FEATURES)):
+                block[f"f{i}"] = q[:, i]
+            buf.append(block)
+            buf_rows += len(block)
+            total += len(block)
+            del feats, q, block
+            if buf_rows >= 20_000_000:
+                io_utils.write_parquet(pd.concat(buf, ignore_index=True),
+                                       out_dir / f"shard_{shard_id}.parquet", 1_000_000)
+                shard_id += 1
+                buf, buf_rows = [], 0
+            print(f"  [{split}] featurized {total:,} pairs", flush=True)
+        if buf:
+            io_utils.write_parquet(pd.concat(buf, ignore_index=True),
+                                   out_dir / f"shard_{shard_id}.parquet", 1_000_000)
+            shard_id += 1
+        io_utils.save_manifest(out_dir / "shard_0.parquet" if shard_id else out_dir / ".keep",
+                               inputs, params, extra={"n_pairs": total, "shards": shard_id})
+        io_utils.json_dump({"n_pairs": total, "shards": shard_id, "features": FEATURES,
+                            "params_fp": io_utils.params_fingerprint(params)}, meta_path)
+        print(f"  [{split}] done: {total:,} pairs -> {shard_id} quantized shards")
+        out_all[split] = str(out_dir)
+        del A, B, s1, s23, is_s3_all
+    return out_all
 
 
 def _free_disk_gb(path: Path) -> float:
@@ -202,79 +313,24 @@ def _free_disk_gb(path: Path) -> float:
     return shutil.disk_usage(str(path)).free / 2**30
 
 
-def run(cfg: dict, force: bool = False) -> dict:
-    art = Path(cfg["paths"]["artifacts_dir"])
-    nrm, blk = art / "normalized", art / "blocking"
-    out_all = {}
-    if _free_disk_gb(art) < 15.0:
-        raise SystemExit(
-            f"S4 aborted: only {_free_disk_gb(art):.1f} GB free (need >= 15 GB). "
-            "Free disk space before building features."
-        )
-    for split in ("train", "test"):
-        out_dir = art / "features" / f"{split}_pairs"
-        meta_path = art / "features" / f"{split}_pairs.meta.json"
-        cand_dir = blk / f"{split}_candidates"
-        inputs = {
-            "cand_dir": str(cand_dir),
-            "s1": nrm / f"{split}_s1.parquet",
-            "s2": nrm / f"{split}_s2.parquet",
-            "s3": nrm / f"{split}_s3.parquet",
-        }
-        params = {"feat_version": 2, "features": FEATURES}
-        if not force and meta_path.exists() and io_utils.manifest_ok(out_dir / "shard_0.parquet", inputs, params):
-            print(f"  [{split}] features fresh — skipping")
-            out_all[split] = str(out_dir)
-            continue
-        if meta_path.exists():
-            meta_path.unlink()
-        if out_dir.exists():
-            for old in out_dir.glob("shard_*.parquet"):
-                old.unlink()
-        out_dir.mkdir(parents=True, exist_ok=True)
+def iter_feature_shards(split: str, cfg: dict, columns: list[str] | None = None):
+    """Yield DECODED feature DataFrames shard-by-shard (S5/S7/S8 consumers).
 
-        print(f"  [{split}] building lookup arrays...", flush=True)
-        s1 = pd.read_parquet(nrm / f"{split}_s1.parquet", columns=["entity_id", "country", *_NAME_COLS, *_ADDR_COLS])
-        s2 = pd.read_parquet(nrm / f"{split}_s2.parquet", columns=["entity_id", "country", *_NAME_COLS, *_ADDR_COLS])
-        s3 = pd.read_parquet(nrm / f"{split}_s3.parquet", columns=["entity_id", "country", *_NAME_COLS, *_ADDR_COLS])
-        A = SideArrays(s1)
-        n_s3 = len(s3)
-        s23 = pd.concat([s2, s3], ignore_index=True)
-        del s2, s3
-        B = SideArrays(s23)
-        is_s3_all = np.zeros(len(s23), dtype=bool)
-        is_s3_all[len(s23) - n_s3:] = True
-
-        CH = 5_000_000
-        shard, shard_id, total = [], 0, 0
-        for it, chunk in enumerate(iter_candidate_shards(split, cfg)):
-            p1 = A.index.get_indexer(chunk["s1_entity_id"].to_numpy())
-            p2 = B.index.get_indexer(chunk["cand_id"].to_numpy())
-            if (p1 < 0).any() or (p2 < 0).any():
-                bad = int((p1 < 0).sum() + (p2 < 0).sum())
-                raise AssertionError(f"candidate id not found in normalized frames: {bad} rows")
-            feats = compute_chunk(A, B, p1, p2, is_s3_all[p2])
-            shard.append(feats)
-            total += len(feats)
-            print(f"  [{split}] chunk {it + 1}: cumulative {total:,} pairs", flush=True)
-            if len(shard) >= 4:
-                io_utils.write_parquet(pd.concat(shard, ignore_index=True), out_dir / f"shard_{shard_id}.parquet")
-                shard_id += 1
-                shard = []
-        if shard:
-            io_utils.write_parquet(pd.concat(shard, ignore_index=True), out_dir / f"shard_{shard_id}.parquet")
-        io_utils.save_manifest(out_dir / "shard_0.parquet", inputs, params,
-                               extra={"n_pairs": total, "shards": shard_id + 1, "features": FEATURES})
-        # also a standalone meta for the dir
-        io_utils.json_dump({"n_pairs": total, "shards": shard_id + 1, "features": FEATURES,
-                            "params_fp": io_utils.params_fingerprint(params)}, meta_path)
-        out_all[split] = str(out_dir)
-        del A, B, s1, s23, is_s3_all
-    return out_all
-
-
-def iter_feature_shards(split: str, cfg: dict):
-    """Yield feature DataFrames shard-by-shard (for S5 training/inference)."""
+    Columns: s1_entity_id, cand_id, 28 float32 features (+ any requested subset).
+    """
     out_dir = Path(cfg["paths"]["artifacts_dir"]) / "features" / f"{split}_pairs"
+    s1_ids = pd.read_parquet(out_dir / "s1_ids.parquet")["entity_id"].to_numpy()
+    cand_ids = pd.read_parquet(out_dir / "cand_ids.parquet")["entity_id"].to_numpy()
+    want_names = [n for n in (columns or FEATURES) if n in FEATURES]
+    idxs = [FEATURES.index(n) for n in want_names]
     for p in sorted(out_dir.glob("shard_*.parquet")):
-        yield pd.read_parquet(p)
+        df = pd.read_parquet(p)
+        out = pd.DataFrame({
+            "s1_entity_id": s1_ids[df["s1_idx"].to_numpy()],
+            "cand_id": cand_ids[df["cand_idx"].to_numpy()],
+        })
+        q = df[[f"f{i}" for i in idxs]].to_numpy(dtype=np.uint8).astype(np.float32) / 255.0
+        for j, name in enumerate(want_names):
+            cap = CAPS.get(name)
+            out[name] = q[:, j] * cap if cap is not None else q[:, j]
+        yield out
