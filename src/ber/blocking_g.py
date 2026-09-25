@@ -24,6 +24,11 @@ from . import io_utils
 
 SLICE_ROWS = 200_000
 TOPK = 100
+# Prune postings for super-common grams: they carry no discriminative signal
+# (every name contains ' a ', 'in', 'an'...) and blow up the per-row cost.
+# df threshold is relative to the per-country slice size.
+DF_FRACTION = 0.005
+MIN_DF_ABS = 3
 
 
 def _char_trigrams(text: str) -> list[str]:
@@ -75,7 +80,12 @@ def run(cfg: dict, force: bool = False) -> dict:
                 gram_counts[i] = len(grams)
                 for tg in set(grams):  # set: postings dedup per candidate
                     inv[tg].append(i)
-            postings = {k: np.asarray(v, dtype=np.int32) for k, v in inv.items()}
+            df_cap = max(MIN_DF_ABS, int(DF_FRACTION * len(s23c)))
+            postings = {k: np.asarray(v, dtype=np.int32) for k, v in inv.items()
+                        if len(v) <= df_cap}
+            n_pruned = len(inv) - len(postings)
+            print(f"  [{split}] {country}: postings {len(postings):,} grams "
+                  f"(pruned {n_pruned:,} with df > {df_cap:,})", flush=True)
             del inv, s23c
 
             s1c_full = pd.read_parquet(nrm / f"{split}_s1.parquet",
@@ -96,8 +106,7 @@ def run(cfg: dict, force: bool = False) -> dict:
                 out_rows: list[int] = []
                 out_vals: list[int] = []
                 for pos, nm in enumerate(sl["name_norm"].to_numpy()):
-                    grams = set(_char_trigrams(nm))
-                    grams = [g for g in grams if g in postings]
+                    grams = [g for g in set(_char_trigrams(nm)) if g in postings]
                     if not grams:
                         continue
                     cand_arr = np.concatenate([postings[g] for g in grams])
