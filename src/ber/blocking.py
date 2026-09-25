@@ -160,19 +160,40 @@ def _trigram_rescue(s1c: pd.DataFrame, index: tuple[dict[str, np.ndarray], np.nd
                             np.asarray(out_vals, dtype=np.int32)])
 
 
-def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, inputs: dict) -> dict:
-    print(f"  [{split}] loading normalized parquets...", flush=True)
-    s1_full = _add_phonetic_cols(pd.read_parquet(nrm / f"{split}_s1.parquet"))
-    s2 = pd.read_parquet(nrm / f"{split}_s2.parquet")
-    s3 = pd.read_parquet(nrm / f"{split}_s3.parquet")
-    s23_full = pd.concat([s2, s3], ignore_index=True)
-    del s2, s3
-    s1_full["bag_nod"] = s1_full["name_bag"].str.replace(DIGITS_RE, "", regex=True).str.strip()
-    s23_full = _add_phonetic_cols(s23_full)
-    s23_full["bag_nod"] = s23_full["name_bag"].str.replace(DIGITS_RE, "", regex=True).str.strip()
-    s23_gid = s23_full["entity_id"].to_numpy()
+BLOCK_COLS = ["entity_id", "country", "name_norm", "name_core", "name_bag",
+              "name_key_phonetic", "addr_postal", "name_tok_n"]
 
-    countries = sorted(s23_full["country"].unique().tolist())
+
+def _prep_s23_country(nrm: Path, split: str, country: str) -> pd.DataFrame:
+    """Load ONLY one country's S2/S3 rows with blocking columns (RAM-bounded).
+    Reads country-partitioned row groups via pyarrow filtering when available."""
+    import pyarrow.parquet as pq
+
+    frames = []
+    for src in ("s2", "s3"):
+        path = nrm / f"{split}_{src}.parquet"
+        names = pq.ParquetFile(path).schema_arrow.names
+        cols = [c for c in BLOCK_COLS if c in names]
+        tbl = pq.read_table(path, columns=cols, filters=[("country", "=", country)])
+        frames.append(tbl.to_pandas())
+        del tbl
+    df = pd.concat(frames, ignore_index=True)
+    del frames
+    df = _add_phonetic_cols(df)
+    df["bag_nod"] = df["name_bag"].str.replace(DIGITS_RE, "", regex=True).str.strip()
+    return df
+
+
+def _s1_country_frame(s1_full: pd.DataFrame, country: str) -> pd.DataFrame:
+    df = s1_full[s1_full["country"] == country].reset_index(drop=True)
+    return df
+
+
+def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, inputs: dict) -> dict:
+    print(f"  [{split}] loading S1 + country inventory...", flush=True)
+    s1_full = _add_phonetic_cols(pd.read_parquet(nrm / f"{split}_s1.parquet"))
+    s1_full["bag_nod"] = s1_full["name_bag"].str.replace(DIGITS_RE, "", regex=True).str.strip()
+    countries = sorted(pd.read_parquet(nrm / f"{split}_s2.parquet", columns=["country"])["country"].unique().tolist())
     print(f"  [{split}] countries: {countries}", flush=True)
     out_dir.mkdir(parents=True, exist_ok=True)
     for old in out_dir.glob("shard_*.parquet"):
@@ -182,13 +203,13 @@ def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, in
     shard_id, total_pairs = 0, 0
     n_s1_total = len(s1_full)
 
+    s23_gid_by_country: dict[str, np.ndarray] = {}
     for country in countries:
-        c_s1_mask = (s1_full["country"] == country).to_numpy()
-        c_s23_mask = (s23_full["country"] == country).to_numpy()
-        s23c_full = s23_full.loc[c_s23_mask].reset_index(drop=True)
-        s23_pos_global = np.where(c_s23_mask)[0].astype(np.int32)
-        s1_pos_global = np.where(c_s1_mask)[0]
-        s1_ids_c = s1_full["entity_id"].to_numpy()[c_s1_mask]
+        print(f"  [{split}] {country}: loading S2/S3 slice...", flush=True)
+        s23c_full = _prep_s23_country(nrm, split, country)
+        s23_gid_c = s23c_full["entity_id"].to_numpy()
+        s1c_full = _s1_country_frame(s1_full, country)
+        s1_ids_c = s1c_full["entity_id"].to_numpy()
 
         # precompute strategy blocks + trigram index ONCE per country
         blocks = {
@@ -204,7 +225,7 @@ def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, in
         n_slices = (len(s1_ids_c) + SLICE_ROWS - 1) // SLICE_ROWS
         for si in range(n_slices):
             lo, hi = si * SLICE_ROWS, min((si + 1) * SLICE_ROWS, len(s1_ids_c))
-            s1c = s1_full.loc[c_s1_mask].iloc[lo:hi].reset_index(drop=True)
+            s1c = s1c_full.iloc[lo:hi].reset_index(drop=True)
             parts: list[np.ndarray] = []
             for tag, col in (("A_bag", "name_bag"), ("B_bag_nod", "bag_nod"),
                              ("C_ph", "ph"), ("E_ph2", "ph2"), ("D_postal", "addr_postal")):
@@ -224,7 +245,7 @@ def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, in
             if len(allp):
                 cand = pd.DataFrame({
                     "s1_entity_id": s1_ids_c[allp[:, 0] + lo],
-                    "cand_id": s23_gid[s23_pos_global[allp[:, 1]]],
+                    "cand_id": s23_gid_c[allp[:, 1]],
                 })
                 io_utils.write_parquet(cand, out_dir / f"shard_{shard_id}.parquet", 200_000)
                 shard_id += 1
@@ -234,7 +255,9 @@ def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, in
             if si % 5 == 0:
                 print(f"  [{split}] {country} slice {si + 1}/{n_slices} — cumulative pairs {total_pairs:,}", flush=True)
             del allp, s1c
-        del blocks, s23c_full, s23_pos_global, s1_ids_c, s1_pos_global, tri_index
+        del blocks, s23c_full, tri_index, s23_gid_c, s1c_full, s1_ids_c
+        import gc
+        gc.collect()
 
     final = {
         "pairs_total": int(total_pairs),
@@ -246,7 +269,7 @@ def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, in
                            extra={"stats": final})
     io_utils.json_dump(final, out_dir.parent / f"{split}_stats.json")
     print(f"  [{split}] candidates: {final['pairs_total']:,} pairs across {shard_id} shards", flush=True)
-    del s1_full, s23_full
+    del s1_full
     return final
 
 
