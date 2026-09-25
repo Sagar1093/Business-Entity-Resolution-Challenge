@@ -1,5 +1,17 @@
 """Stage registry: dependency order + metadata. Extended as stages are implemented."""
-from . import s0_env, s1_validate, s2_normalize, s3_blocking, s_eda, s_splits
+from . import (
+    s0_env,
+    s1_validate,
+    s2_normalize,
+    s3_blocking,
+    s4_features,
+    s5_model,
+    s6_rerank,
+    s7_decision,
+    s8_outputs,
+    s_eda,
+    s_splits,
+)
 
 STAGES = {
     "s0_env": {"run": s0_env.run, "desc": "hardware/environment detection gate (S0)"},
@@ -8,4 +20,9 @@ STAGES = {
     "splits": {"run": s_splits.run, "desc": "grouped 90/10 split by S1 entity"},
     "normalize": {"run": s2_normalize.run, "desc": "S2 normalization of all 6 source files (parquet)"},
     "blocking": {"run": s3_blocking.run, "desc": "S3 multi-strategy blocking -> candidate pairs (train+test)"},
+    "features": {"run": s4_features.run, "desc": "S4 pair feature engineering (vectorized, sharded)"},
+    "model": {"run": s5_model.run, "desc": "S5 LightGBM pair classifier + val F0.5 sweep"},
+    "rerank": {"run": s6_rerank.run, "desc": "S6 bge-reranker difficult-band scoring (guarded)"},
+    "decision": {"run": s7_decision.run, "desc": "S7 calibration + decision engine (F0.5 thresholds)"},
+    "outputs": {"run": s8_outputs.run, "desc": "S8 write matching_results.tsv + candidate_pairs.tsv"},
 }
