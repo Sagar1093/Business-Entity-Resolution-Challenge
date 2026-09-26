@@ -282,7 +282,12 @@ def iter_candidate_shards(split: str, cfg: dict):
     out_dir = Path(cfg["paths"]["artifacts_dir"]) / "blocking" / f"{split}_candidates"
     g_dir = Path(cfg["paths"]["artifacts_dir"]) / "blocking" / f"{split}_candidates_g"
     g_files = {p.name: p for p in sorted(g_dir.glob("shard_*.parquet"))} if g_dir.exists() else {}
-    for p in sorted(out_dir.glob("shard_*.parquet")):
+    base_files = sorted(out_dir.glob("shard_*.parquet"))
+    if g_files and len(g_files) != len(base_files):
+        raise RuntimeError(
+            f"[{split}] G/base shard-count mismatch: {len(g_files)} G vs {len(base_files)} base — "
+            "shards must be slice-aligned (same country order + slice size). Regenerate both.")
+    for p in base_files:
         base = pd.read_parquet(p)
         g = g_files.get(p.name)
         if g is not None:

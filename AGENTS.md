@@ -22,7 +22,7 @@ A local, production-quality entity-resolution pipeline that matches Source 1 (de
 - **Python lives in `.venv` only (3.12, created via uv). Never install anything globally.** Run tools as `.venv/Scripts/python.exe` (Git Bash: `.venv/Scripts/python`).
 - GPU: RTX 4060 Laptop 8 GB VRAM — detect via `src/ber/env.py`; use fp16 and batch-size autosweep; keep 4-bit for the LLM stage. CPU fallbacks must exist for every GPU stage.
 - RAM ~24 GB; never load whole multi-GB files into memory — chunk everything (see `src/ber/io_utils.py`).
-- Disk budget: ~49 GB free. Artifacts (parquet, embeddings, FAISS indexes) can grow large; clean up stale intermediates rather than committing them.
+- Disk budget: ~30 GB free. Artifacts (parquet, embeddings, FAISS indexes) can grow large; clean up stale intermediates rather than committing them.
 
 ## Pipeline conventions
 
