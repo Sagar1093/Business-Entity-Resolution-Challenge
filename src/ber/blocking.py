@@ -6,6 +6,8 @@ open-set pair property; France or any new label works with zero changes).
 Strategies (union; block cap 2000; per-S1 final cap 1000):
   A  name-bag exact, B digit-stripped bag, C metaphone(4), E metaphone(2),
   D postal co-occurrence, F char-3gram top-K rescue for uncovered S1 rows.
+  Rescue stages (slice-aligned, ALL rows): G char-3gram top-K, H
+  rarity-weighted address-token top-K (generic-name entities).
 
 Memory design (fixed OOM): S1 is processed in 200k-row slices; per slice we
 emit candidate pairs for all strategies (int32 positions), dedup, apply the
@@ -276,24 +278,31 @@ def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, in
 def iter_candidate_shards(split: str, cfg: dict):
     """Yield UNIONED+DEDUPED candidate DataFrames shard-by-shard.
 
-    Merges the base shards with the slice-aligned G (trigram) shards when
-    present; dedup via packed int64 keys. Consumed by features/outputs.
+    Merges the base shards with the slice-aligned rescue shards (G trigram,
+    H address-token) when present; dedup via pair columns. Consumed by
+    features/outputs.
     """
     out_dir = Path(cfg["paths"]["artifacts_dir"]) / "blocking" / f"{split}_candidates"
-    g_dir = Path(cfg["paths"]["artifacts_dir"]) / "blocking" / f"{split}_candidates_g"
-    g_files = {p.name: p for p in sorted(g_dir.glob("shard_*.parquet"))} if g_dir.exists() else {}
+    extra_maps: list[dict[str, Path]] = []
+    for tag in ("g", "h"):
+        d = Path(cfg["paths"]["artifacts_dir"]) / "blocking" / f"{split}_candidates_{tag}"
+        if d.exists():
+            extra_maps.append({p.name: p for p in sorted(d.glob("shard_*.parquet"))})
     base_files = sorted(out_dir.glob("shard_*.parquet"))
-    if g_files and len(g_files) != len(base_files):
-        raise RuntimeError(
-            f"[{split}] G/base shard-count mismatch: {len(g_files)} G vs {len(base_files)} base — "
-            "shards must be slice-aligned (same country order + slice size). Regenerate both.")
+    for i, files in enumerate(extra_maps):
+        if files and len(files) != len(base_files):
+            tag = ("g", "h")[i]
+            raise RuntimeError(
+                f"[{split}] {tag.upper()}/base shard-count mismatch: {len(files)} rescue vs "
+                f"{len(base_files)} base — shards must be slice-aligned. Regenerate both.")
     for p in base_files:
         base = pd.read_parquet(p)
-        g = g_files.get(p.name)
-        if g is not None:
-            base = pd.concat([base, pd.read_parquet(g, columns=["s1_entity_id", "cand_id"])],
-                             ignore_index=True)
-            base = base.drop_duplicates(subset=["s1_entity_id", "cand_id"])
+        for files in extra_maps:
+            extra = files.get(p.name)
+            if extra is not None:
+                base = pd.concat([base, pd.read_parquet(extra, columns=["s1_entity_id", "cand_id"])],
+                                 ignore_index=True)
+        base = base.drop_duplicates(subset=["s1_entity_id", "cand_id"])
         yield base
 
 

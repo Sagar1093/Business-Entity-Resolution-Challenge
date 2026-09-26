@@ -40,6 +40,14 @@ blocking:
     tfidf_lsh: true             # char 3-4gram + word, MinHashLSH top-K
     numeric_keys: true          # postal / house-number digit runs
     supervised_bootstrap: true  # train-only mining of extra keys via tiny LGBM
+  rescue_g:                     # S3-G char-trigram top-K for ALL S1 rows
+    topk: 100
+    df_fraction: 0.005
+    min_df_abs: 3
+  rescue_h:                     # S3-H rarity-weighted address-token top-K
+    topk: 200
+    df_min: 3
+    df_cap: 5000
     wide_fallback: true         # empty/short-field entities get widest key
   lsh:
     num_perm: 128

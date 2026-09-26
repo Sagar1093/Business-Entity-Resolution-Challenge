@@ -40,23 +40,29 @@ def run(cfg: dict, force: bool = False) -> dict:
     n_cand = 0
     cand_per_s1: dict[str, int] = {}
     cand_dir = art / "blocking" / "train_candidates"
-    g_dir = art / "blocking" / "train_candidates_g"
     base_shards = sorted(cand_dir.glob("shard_*.parquet"))
-    g_map = {p.name: p for p in sorted(g_dir.glob("shard_*.parquet"))} if g_dir.exists() else {}
-    if g_map and len(g_map) != len(base_shards):
-        raise RuntimeError(
-            f"G/base shard-count mismatch in audit: {len(g_map)} G vs {len(base_shards)} base — "
-            "shards must be slice-aligned.")
+    rescue_maps: list[dict[str, Path]] = []
+    for tag in ("g", "h"):
+        d = art / "blocking" / f"train_candidates_{tag}"
+        if d.exists():
+            rescue_maps.append({p.name: p for p in sorted(d.glob("shard_*.parquet"))})
+    for i, files in enumerate(rescue_maps):
+        if files and len(files) != len(base_shards):
+            tag = ("g", "h")[i]
+            raise RuntimeError(
+                f"{tag.upper()}/base shard-count mismatch in audit: {len(files)} vs "
+                f"{len(base_shards)} — shards must be slice-aligned.")
 
     def _val_union(shard: Path) -> pd.DataFrame:
         df = pd.read_parquet(shard)
         df = df[df["s1_entity_id"].isin(val_ids)]
-        g = g_map.get(shard.name)
-        if g is not None:
-            dg = pd.read_parquet(g, columns=["s1_entity_id", "cand_id"])
-            dg = dg[dg["s1_entity_id"].isin(val_ids)]
-            df = pd.concat([df, dg], ignore_index=True).drop_duplicates(
-                subset=["s1_entity_id", "cand_id"])
+        for files in rescue_maps:
+            rp = files.get(shard.name)
+            if rp is not None:
+                dr = pd.read_parquet(rp, columns=["s1_entity_id", "cand_id"])
+                dr = dr[dr["s1_entity_id"].isin(val_ids)]
+                df = pd.concat([df, dr], ignore_index=True)
+        df = df.drop_duplicates(subset=["s1_entity_id", "cand_id"])
         return df
 
     for shard in base_shards:
