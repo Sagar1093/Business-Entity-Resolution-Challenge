@@ -331,13 +331,15 @@ def run(cfg: dict, force: bool = False) -> dict:
             # entity within each rescue file and each entity's candidates are
             # two contiguous runs (S2 block then S3 block)
             new_seg = np.r_[True, (p1[1:] != p1[:-1]) | (src[1:] != src[:-1])]
-            if carry_key is not None and len(p1) and (p1[0], src[0]) == carry_key:
+            continuation = bool(carry_key is not None and len(p1) and (p1[0], src[0]) == carry_key)
+            if continuation:
                 new_seg[0] = False
             starts = np.flatnonzero(new_seg)
+            starts = np.r_[0, starts[starts > 0]]  # first in-batch segment starts at 0
             bounds = np.r_[starts, len(p1)]
             seg_lens = np.diff(bounds)
             ranks = np.arange(len(p1)) - np.repeat(starts, seg_lens)
-            if carry_key is not None and not new_seg[0]:
+            if continuation:
                 ranks[:bounds[1]] += carry_rank
             keep = ((src == 0) & (ranks < n_s2_cap)) | ((src == 1) & (ranks < n_s3_cap))
             if keep.any():
