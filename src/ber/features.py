@@ -244,7 +244,14 @@ def run(cfg: dict, force: bool = False) -> dict:
             "s2": nrm / f"{split}_s2.parquet",
             "s3": nrm / f"{split}_s3.parquet",
         }
-        params = {"feat_version": 3, "features": FEATURES, "quantization": "uint8/255"}
+        # rescue shards (G/H) participate in the union -> fingerprint them too
+        for tag in ("g", "h"):
+            d = blk / f"{split}_candidates_{tag}"
+            if d.exists():
+                inputs[f"cand_{tag}"] = str(d)
+        compression = (cfg.get("features", {}) or {}).get("compression", "snappy")
+        params = {"feat_version": 3, "features": FEATURES, "quantization": "uint8/255",
+                  "compression": compression}
         fresh = meta_path.exists() and not force
         if fresh:
             print(f"  [{split}] features fresh — skipping")
@@ -289,13 +296,15 @@ def run(cfg: dict, force: bool = False) -> dict:
             del feats, q, block
             if buf_rows >= 20_000_000:
                 io_utils.write_parquet(pd.concat(buf, ignore_index=True),
-                                       out_dir / f"shard_{shard_id}.parquet", 1_000_000)
+                                       out_dir / f"shard_{shard_id}.parquet", 1_000_000,
+                                       compression=compression)
                 shard_id += 1
                 buf, buf_rows = [], 0
             print(f"  [{split}] featurized {total:,} pairs", flush=True)
         if buf:
             io_utils.write_parquet(pd.concat(buf, ignore_index=True),
-                                   out_dir / f"shard_{shard_id}.parquet", 1_000_000)
+                                   out_dir / f"shard_{shard_id}.parquet", 1_000_000,
+                                   compression=compression)
             shard_id += 1
         io_utils.save_manifest(out_dir / "shard_0.parquet" if shard_id else out_dir / ".keep",
                                inputs, params, extra={"n_pairs": total, "shards": shard_id})

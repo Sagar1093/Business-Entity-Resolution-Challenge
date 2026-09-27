@@ -57,6 +57,7 @@ blocking:
     top_k: 100
 
 features:
+  compression: zstd             # uint8 quantized shards compress ~2x vs snappy
   tfidf:
     name_analyzers: [char_wb_3_4, word]
     address_analyzers: [char_wb_3_4, word]

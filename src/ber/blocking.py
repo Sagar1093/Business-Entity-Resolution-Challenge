@@ -19,6 +19,7 @@ Output: artifacts/blocking/{split}_candidates/shard_*.parquet
 """
 from __future__ import annotations
 
+import json
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -71,8 +72,17 @@ def _add_phonetic_cols(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _blocks(s23c: pd.DataFrame, col: str) -> dict[str, np.ndarray]:
-    sub = s23c[s23c[col] != ""]
-    return {k: v for k, v in sub.groupby(col, sort=False).indices.items()}
+    """key -> int32 positions in the FULL country frame (never the filtered one).
+
+    groupby.indices are positions within the frame passed in; callers index
+    s23_gid_c (full frame) with them, so the empty-key rows must stay in place.
+    Filtering them out shifted every subsequent position (catastrophic for
+    addr_postal where ~99% of rows are empty — pairs mapped to wrong rows).
+    The "" group is dropped instead.
+    """
+    idx = s23c.groupby(col, sort=False).indices
+    idx.pop("", None)
+    return {k: np.asarray(v, dtype=np.int32) for k, v in idx.items()}
 
 
 def _emit_exact(s1c: pd.DataFrame, blocks: dict[str, np.ndarray], col: str,
@@ -191,22 +201,72 @@ def _s1_country_frame(s1_full: pd.DataFrame, country: str) -> pd.DataFrame:
     return df
 
 
-def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, inputs: dict) -> dict:
+def _save_progress(prog_path: Path, completed: dict[str, int]) -> None:
+    tmp = prog_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"completed": completed}), encoding="utf-8")
+    tmp.replace(prog_path)
+
+
+def _load_progress(out_dir: Path) -> tuple[dict[str, int], int]:
+    """Validated (country|slice) -> row-count map + total; corrupt shards dropped."""
+    import pyarrow.parquet as pq
+
+    prog_path = out_dir / "progress.json"
+    if not prog_path.exists():
+        return {}, 0
+    completed: dict[str, int] = {}
+    total = 0
+    for key, name in json.loads(prog_path.read_text(encoding="utf-8")).get("completed", {}).items():
+        p = out_dir / name
+        try:
+            names = pq.ParquetFile(p).schema_arrow.names
+            if names != ["s1_entity_id", "cand_id"]:
+                raise ValueError(f"bad schema {names}")
+            rows = pq.read_metadata(p).num_rows
+            completed[key] = rows
+            total += rows
+        except Exception as e:
+            print(f"  [resume] dropping unusable shard {name} ({e!r}) — will redo {key}", flush=True)
+            p.unlink(missing_ok=True)
+    return completed, total
+
+
+def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, inputs: dict,
+               force: bool = False) -> dict:
     print(f"  [{split}] loading S1 + country inventory...", flush=True)
     s1_full = _add_phonetic_cols(pd.read_parquet(nrm / f"{split}_s1.parquet"))
     s1_full["bag_nod"] = s1_full["name_bag"].str.replace(DIGITS_RE, "", regex=True).str.strip()
     countries = sorted(pd.read_parquet(nrm / f"{split}_s2.parquet", columns=["country"])["country"].unique().tolist())
     print(f"  [{split}] countries: {countries}", flush=True)
     out_dir.mkdir(parents=True, exist_ok=True)
-    for old in out_dir.glob("shard_*.parquet"):
-        old.unlink()
+    prog_path = out_dir / "progress.json"
+    if force or not prog_path.exists():
+        for old in out_dir.glob("shard_*.parquet"):
+            old.unlink()
+        (out_dir / "shard_0.meta.json").unlink(missing_ok=True)
+        (out_dir / ".keep.meta.json").unlink(missing_ok=True)
+        _save_progress(prog_path, {})
+        completed: dict[str, int] = {}
+        total_pairs = 0
+    else:
+        completed, total_pairs = _load_progress(out_dir)
+        if completed:
+            print(f"  [{split}] resuming — {len(completed)} slices already done "
+                  f"({total_pairs:,} pairs on disk)", flush=True)
 
     stats: dict = {}
-    shard_id, total_pairs = 0, 0
+    resumed_count = len(completed)
+    cum_slices = 0
     n_s1_total = len(s1_full)
 
     s23_gid_by_country: dict[str, np.ndarray] = {}
     for country in countries:
+        n_c = int((s1_full["country"] == country).sum())
+        n_slices_c = (n_c + SLICE_ROWS - 1) // SLICE_ROWS
+        if all(f"{country}|{si}" in completed for si in range(n_slices_c)):
+            cum_slices += n_slices_c
+            print(f"  [{split}] {country}: all {n_slices_c} slices done — skipping", flush=True)
+            continue
         print(f"  [{split}] {country}: loading S2/S3 slice...", flush=True)
         s23c_full = _prep_s23_country(nrm, split, country)
         s23_gid_c = s23c_full["entity_id"].to_numpy()
@@ -226,6 +286,11 @@ def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, in
 
         n_slices = (len(s1_ids_c) + SLICE_ROWS - 1) // SLICE_ROWS
         for si in range(n_slices):
+            key = f"{country}|{si}"
+            if key in completed:
+                print(f"  [{split}] {country} slice {si + 1}/{n_slices} — already done "
+                      f"({completed[key]:,} pairs)", flush=True)
+                continue
             lo, hi = si * SLICE_ROWS, min((si + 1) * SLICE_ROWS, len(s1_ids_c))
             s1c = s1c_full.iloc[lo:hi].reset_index(drop=True)
             parts: list[np.ndarray] = []
@@ -249,28 +314,37 @@ def _run_split(cfg: dict, split: str, nrm: Path, out_dir: Path, params: dict, in
                     "s1_entity_id": s1_ids_c[allp[:, 0] + lo],
                     "cand_id": s23_gid_c[allp[:, 1]],
                 })
-                io_utils.write_parquet(cand, out_dir / f"shard_{shard_id}.parquet", 200_000)
-                shard_id += 1
-                total_pairs += len(cand)
-                del cand
+            else:
+                # always write a shard (even empty) to keep 1:1 slice alignment
+                # with the G/H rescue shards paired by filename
+                cand = pd.DataFrame({"s1_entity_id": pd.Series(dtype=object),
+                                     "cand_id": pd.Series(dtype=object)})
+            io_utils.write_parquet(cand, out_dir / f"shard_{cum_slices + si}.parquet", 200_000)
+            total_pairs += len(cand)
+            completed[key] = len(cand)
+            _save_progress(prog_path, completed)
+            del cand
             stats[f"{split}.{country}.slices.capped"] = stats.get(f"{split}.{country}.slices.capped", 0) + n_capped
             if si % 5 == 0:
                 print(f"  [{split}] {country} slice {si + 1}/{n_slices} — cumulative pairs {total_pairs:,}", flush=True)
             del allp, s1c
+        cum_slices += n_slices
         del blocks, s23c_full, tri_index, s23_gid_c, s1c_full, s1_ids_c
         import gc
         gc.collect()
 
     final = {
         "pairs_total": int(total_pairs),
-        "shards": shard_id,
+        "shards": int(cum_slices),
         "s1_total": int(n_s1_total),
+        "resumed_slices": int(resumed_count),
         "per_strategy": {k: v for k, v in stats.items() if not k.endswith("capped")},
     }
-    io_utils.save_manifest(out_dir / "shard_0.parquet" if shard_id else out_dir / ".keep", inputs, params,
+    io_utils.save_manifest(out_dir / "shard_0.parquet" if cum_slices else out_dir / ".keep", inputs, params,
                            extra={"stats": final})
     io_utils.json_dump(final, out_dir.parent / f"{split}_stats.json")
-    print(f"  [{split}] candidates: {final['pairs_total']:,} pairs across {shard_id} shards", flush=True)
+    prog_path.unlink(missing_ok=True)
+    print(f"  [{split}] candidates: {final['pairs_total']:,} pairs across {cum_slices} shards", flush=True)
     del s1_full
     return final
 
@@ -313,12 +387,12 @@ def run(cfg: dict, force: bool = False) -> dict:
     for split in ("train", "test"):
         out_dir = art / "blocking" / f"{split}_candidates"
         inputs = {f"{split}_{s}": nrm / f"{split}_{s}.parquet" for s in ("s1", "s2", "s3")}
-        params = {"v": 3, "cap": S1_FINAL_CAP, "block_cap": BLOCK_CAP, "topk": TRIGRAM_TOPK}
+        params = {"v": 4, "cap": S1_FINAL_CAP, "block_cap": BLOCK_CAP, "topk": TRIGRAM_TOPK}
         marker = out_dir / "shard_0.parquet"
         if not force and marker.exists() and io_utils.manifest_ok(marker, inputs, params):
             st = io_utils.json_load(out_dir.parent / f"{split}_stats.json")
             print(f"  [{split}] candidates fresh — skipping ({st['pairs_total']:,} pairs)")
             out_all[split] = str(out_dir)
             continue
-        out_all[split] = _run_split(cfg, split, nrm, out_dir, params, inputs)
+        out_all[split] = _run_split(cfg, split, nrm, out_dir, params, inputs, force=force)
     return out_all

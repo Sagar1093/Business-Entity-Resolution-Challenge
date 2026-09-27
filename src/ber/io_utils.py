@@ -123,8 +123,10 @@ def df_to_tsv(df: pd.DataFrame, path: str | Path) -> None:
     df.to_csv(path, sep="\t", index=False, encoding="utf-8", lineterminator="\n")
 
 
-def write_parquet(df: pd.DataFrame, path: str | Path, row_group_size: int = 500_000) -> None:
-    df.to_parquet(path, engine="pyarrow", row_group_size=row_group_size, index=False)
+def write_parquet(df: pd.DataFrame, path: str | Path, row_group_size: int = 500_000,
+                  compression: str = "snappy") -> None:
+    df.to_parquet(path, engine="pyarrow", row_group_size=row_group_size, index=False,
+                  compression=compression)
 
 
 def read_parquet(path: str | Path, columns: list[str] | None = None) -> pd.DataFrame:

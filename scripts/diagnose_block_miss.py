@@ -37,7 +37,7 @@ def main() -> None:
 
     # candidate sets (base+G union, val only)
     val_cands: dict[str, set[str]] = {}
-    for d in ("train_candidates", "train_candidates_g"):
+    for d in ("train_candidates", "train_candidates_g", "train_candidates_h"):
         for p in sorted((ART.parent / "blocking" / d).glob("shard_*.parquet")):
             df = pd.read_parquet(p, columns=["s1_entity_id", "cand_id"])
             df = df[df["s1_entity_id"].isin(val_ids)]
