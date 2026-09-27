@@ -400,8 +400,13 @@ def iter_candidate_shards(split: str, cfg: dict):
         for p in base_files:
             yield pd.read_parquet(p)
         return
+    fc = (cfg.get("features", {}) or {})
+    if split == "test" and bool(fc.get("resume_keep_train", False)):
+        tags = ("g",)  # deadline mode: test features from G (trigram) candidates only
+    else:
+        tags = ("g", "h")
     cap = int((cfg.get("blocking", {}) or {}).get("union_cap_per_s1", 0)) or 0
-    for tag in ("g", "h"):
+    for tag in tags:
         d = blk / f"{split}_candidates_{tag}"
         if not d.exists():
             continue

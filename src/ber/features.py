@@ -261,6 +261,20 @@ def run(cfg: dict, force: bool = False) -> dict:
     for split in ("train", "test"):
         out_dir = art / "features" / f"{split}_pairs"
         meta_path = art / "features" / f"{split}_pairs.meta.json"
+        if split == "train" and bool(fc.get("resume_keep_train", False)) and out_dir.exists() \
+                and any(out_dir.glob("shard_*.parquet")):
+            # Deadline resume: trust the flushed shards from the interrupted run.
+            import pyarrow.parquet as _pq
+            kept = sum(_pq.ParquetFile(p).metadata.num_rows
+                       for p in sorted(out_dir.glob("shard_*.parquet")))
+            io_utils.json_dump({"n_pairs": kept, "shards": len(list(out_dir.glob("shard_*.parquet"))),
+                                "features": FEATURES, "resumed": True}, meta_path)
+            print(f"  [train] resumed: kept {kept:,} pairs in flushed shards — skipping")
+            out_all[split] = str(out_dir)
+            continue
+        if split == "test":
+            n_s2_cap = int(fc.get("test_n_s2_cap", n_s2_cap))
+            n_s3_cap = int(fc.get("test_n_s3_cap", n_s3_cap))
         inputs = {f"{split}_{s}": nrm / f"{split}_{s}.parquet" for s in ("s1", "s2", "s3")}
         for tag in ("g", "h"):
             d = art / "blocking" / f"{split}_candidates_{tag}"
@@ -367,7 +381,7 @@ def run(cfg: dict, force: bool = False) -> dict:
             carry_key = (int(p1[-1]), int(src[-1])) if len(p1) else None
             carry_rank = int(ranks[-1]) + 1 if len(p1) else 0
             del chunk, p1, p2, src, ranks, keep
-            print(f"  [{split}] featurized {total:,} pairs (shard {shard_id})", flush=True)
+            print(f"  [{split}] featurized {total:,} pairs (shard {shard_id}, buf {buf_rows:,})", flush=True)
         flush()
         io_utils.save_manifest(out_dir / "shard_0.parquet" if shard_id else out_dir / ".keep",
                                inputs, params, extra={"n_pairs": total, "shards": shard_id})
