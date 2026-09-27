@@ -1,14 +1,17 @@
-"""S5 — LightGBM pair classifier (index-based streaming; full implementation).
+"""S5 — LightGBM pair classifier (feature-shard streaming; low-RAM).
 
 Data flow (train):
-  pass A: stream candidate index shards -> labels via packed GT lookup;
-          count pos/neg per shard; per-shard seeded choice of
-          neg_ratio*n_pos negatives (deterministic, resumable).
-  pass B: featurize ONLY selected rows (positives + sampled negatives)
-          plus ALL val-entity rows (unbiased calibration set).
+  pass A: stream FEATURE shards -> labels via packed GT lookup;
+          per-shard seeded negative sampling (neg_ratio per positive);
+          val-entity rows capped per entity (val_cap_per_s1).
+  pass B: re-stream feature shards, keep selected rows only, assemble
+          float32 matrices (~1-2 GB at emergency caps).
   train LightGBM w/ early stopping on val; LR baseline; save model.
 Val scoring -> artifacts/features/val_scores.parquet (s1_idx, cand_idx, p_match)
 Test scoring -> artifacts/features/test_scores/shard_* (same columns)
+
+Features are NEVER recomputed here — they are read from the S4 shards
+(uint8, decoded to float32 per shard).
 """
 from __future__ import annotations
 
@@ -18,8 +21,7 @@ import numpy as np
 import pandas as pd
 
 from . import io_utils, metrics
-from .blocking import iter_candidate_shards, union_shard_names, read_union_shard
-from .features import (FEATURES, SideArrays, compute_features, _NAME_COLS, _ADDR_COLS)
+from .features import FEATURES, iter_feature_shards
 
 PACK_MUL = 10_500_000  # > max cand index (10.3M)
 
@@ -58,25 +60,6 @@ def _gt_packed_sorted(cfg: dict, s1_ids: np.ndarray, cand_ids: np.ndarray,
     return np.sort(np.unique(packed))
 
 
-def _load_side_arrays(nrm: Path, split: str):
-    cols = ["entity_id", "country", *_NAME_COLS, *_ADDR_COLS]
-    s1 = pd.read_parquet(nrm / f"{split}_s1.parquet", columns=cols)
-    s2 = pd.read_parquet(nrm / f"{split}_s2.parquet", columns=cols)
-    s3 = pd.read_parquet(nrm / f"{split}_s3.parquet", columns=cols)
-    n_s3 = len(s3)
-    s23 = pd.concat([s2, s3], ignore_index=True)
-    del s2, s3
-    A, B = SideArrays(s1), SideArrays(s23)
-    is_s3 = np.zeros(len(s23), dtype=bool)
-    is_s3[len(s23) - n_s3:] = True
-    return A, B, is_s3
-
-
-def _index_shards_exist(cfg: dict, split: str) -> bool:
-    d = Path(cfg["paths"]["artifacts_dir"]) / "features" / f"{split}_pairs"
-    return (d / "s1_ids.parquet").exists() and any(d.glob("shard_*.parquet"))
-
-
 def run(cfg: dict, force: bool = False) -> dict:
     art = Path(cfg["paths"]["artifacts_dir"])
     models_dir = Path(cfg["paths"]["models_dir"])
@@ -100,77 +83,70 @@ def run(cfg: dict, force: bool = False) -> dict:
     gt_train = _gt_packed_sorted(cfg, s1_ids, cand_ids, train_ids)
     gt_val = _gt_packed_sorted(cfg, s1_ids, cand_ids, val_ids)
     neg_ratio = int(cfg["model"].get("train_neg_ratio", 3))
+    val_cap = int(cfg["model"].get("val_cap_per_s1", 0)) or None
     seed = int(cfg["seed"])
 
-    # ---- pass A: labels/counts + per-shard negative selection ----
-    shard_names = union_shard_names("train", cfg)
-    shard_files = [Path(cfg["paths"]["artifacts_dir"]) / "blocking" / "train_candidates" / n
-                   for n in shard_names]
-    val_cap = int(cfg["model"].get("val_cap_per_s1", 0)) or None
+    # ---- pass A: labels/counts + per-shard selection plan ----
     plan: list[dict] = []
-    tot_pos = tot_neg = 0
-    print("pass A: counting positives/negatives per shard...", flush=True)
-    for si, name in enumerate(shard_names):
-        cand = read_union_shard("train", cfg, name)
-        if cand is None:
-            plan.append({"shard": si, "name": name, "pos": np.empty(0, np.int64),
-                         "neg": np.empty(0, np.int64), "val": np.empty(0, np.int64)})
-            continue
-        if val_cap is not None:
-            keep = cand.groupby("s1_entity_id", sort=False).cumcount() < val_cap
-            cand = cand[keep.to_numpy() if hasattr(keep, "to_numpy") else keep]
-        p1 = _pos_of(s1_ids, cand["s1_entity_id"].to_numpy())
-        p2 = _pos_of(cand_ids, cand["cand_id"].to_numpy())
-        y = _labels_for(p1, p2, gt_train)
-        is_val = val_row_mask[p1]
+    tot_pos = tot_neg = tot_val = 0
+    print("pass A: scanning feature shards for labels...", flush=True)
+    for si, (r1, r2, _Q) in enumerate(iter_feature_shards("train", cfg)):
+        y = _labels_for(r1, r2, gt_train)
+        is_val = val_row_mask[r1]
         pos_idx = np.where((y == 1) & ~is_val)[0]
         neg_idx = np.where((y == 0) & ~is_val)[0]
         rng = np.random.default_rng(seed + si)
         take = min(len(neg_idx), neg_ratio * len(pos_idx))
         neg_sel = rng.choice(neg_idx, size=take, replace=False) if take else np.empty(0, np.int64)
         val_idx = np.where(is_val)[0]
-        if val_cap is not None and len(val_idx) > val_cap:
-            val_idx = np.sort(rng.permutation(val_idx)[:val_cap])
-        plan.append({"shard": si, "name": name, "pos": pos_idx, "neg": np.sort(neg_sel), "val": val_idx})
+        if val_cap is not None and len(val_idx):
+            # per-entity cap within this shard (groups contiguous per entity)
+            ent = r1[val_idx]
+            order = np.argsort(ent, kind="stable")
+            ent_sorted = ent[order]
+            starts = np.r_[0, np.flatnonzero(np.diff(ent_sorted)) + 1]
+            ranks = np.arange(len(ent_sorted)) - np.repeat(starts, np.diff(np.r_[starts, len(ent_sorted)]))
+            keep_sorted = ranks < val_cap
+            keep = np.zeros(len(val_idx), dtype=bool)
+            keep[order[keep_sorted]] = True
+            val_idx = val_idx[keep]
+        plan.append({"si": si, "pos": pos_idx, "neg": np.sort(neg_sel), "val": val_idx})
         tot_pos += len(pos_idx)
         tot_neg += len(neg_sel)
-        print(f"  shard {si + 1}/{len(shard_names)}: pos={len(pos_idx):,} neg_kept={take:,} val={len(val_idx):,}", flush=True)
-        del cand, p1, p2, y
-    print(f"pass A totals: positives={tot_pos:,} negatives_kept={tot_neg:,}", flush=True)
+        tot_val += len(val_idx)
+        print(f"  shard {si + 1}: pos={len(pos_idx):,} neg_kept={take:,} val={len(val_idx):,}", flush=True)
+        del r1, r2, y, is_val
+    print(f"pass A totals: positives={tot_pos:,} negatives_kept={tot_neg:,} val_rows={tot_val:,}", flush=True)
 
-    # ---- pass B: featurize selected rows ----
-    print("pass B: featurizing selected rows...", flush=True)
-    A, B, is_s3_all = _load_side_arrays(art / "normalized", "train")
-    X_parts, y_parts = [], []
-    va_X, va_p1_all, va_p2_all = [], [], []
-    for item in plan:
-        cand = read_union_shard("train", cfg, item["name"])
-        if val_cap is not None and cand is not None:
-            keep = cand.groupby("s1_entity_id", sort=False).cumcount() < val_cap
-            cand = cand[keep.to_numpy() if hasattr(keep, "to_numpy") else keep]
-        p1 = _pos_of(s1_ids, cand["s1_entity_id"].to_numpy())
-        p2 = _pos_of(cand_ids, cand["cand_id"].to_numpy())
-        del cand
-        sel = np.unique(np.concatenate([item["pos"], item["neg"], item["val"]]))
-        f = compute_features(A, B, p1[sel], p2[sel], is_s3_all[p2[sel]])
-        X = np.stack([f[name] for name in FEATURES], axis=1)
-        del f
-        pos_in_sel = np.isin(sel, item["pos"])
-        val_in_sel = np.isin(sel, item["val"])
-        tr_mask = ~val_in_sel
-        X_parts.append(X[tr_mask])
-        y_parts.append(pos_in_sel[tr_mask].astype(np.int8))
-        va_X.append(X[val_in_sel])
-        va_p1_all.append(p1[sel][val_in_sel])
-        va_p2_all.append(p2[sel][val_in_sel])
-        del X, sel, pos_in_sel, val_in_sel, tr_mask
-        print(f"  featurized shard {item['shard'] + 1}/{len(plan)}", flush=True)
-    X_tr = np.concatenate(X_parts)
-    y_tr = np.concatenate(y_parts)
-    X_va = np.concatenate(va_X)
-    va_p1 = np.concatenate(va_p1_all)
-    va_p2 = np.concatenate(va_p2_all)
-    del X_parts, y_parts, va_X, va_p1_all, va_p2_all, A, B, is_s3_all, plan
+    # ---- pass B: assemble matrices from the persisted features ----
+    print("pass B: assembling matrices...", flush=True)
+    X_tr_parts: list[np.ndarray] = []
+    y_tr_parts: list[np.ndarray] = []
+    X_va_parts: list[np.ndarray] = []
+    va_p1_parts: list[np.ndarray] = []
+    va_p2_parts: list[np.ndarray] = []
+    for si, (r1, r2, Q) in enumerate(iter_feature_shards("train", cfg)):
+        item = plan[si]
+        sel = np.unique(np.concatenate([item["pos"], item["neg"], item["val"]])) if (
+            len(item["pos"]) or len(item["neg"]) or len(item["val"])) else np.empty(0, np.int64)
+        if len(sel):
+            X = Q[sel].astype(np.float32) / 255.0
+            pos_in_sel = np.isin(sel, item["pos"])
+            val_in_sel = np.isin(sel, item["val"])
+            tr_mask = ~val_in_sel
+            X_tr_parts.append(X[tr_mask])
+            y_tr_parts.append(pos_in_sel[tr_mask].astype(np.int8))
+            X_va_parts.append(X[val_in_sel])
+            va_p1_parts.append(r1[sel][val_in_sel])
+            va_p2_parts.append(r2[sel][val_in_sel])
+            del X
+        del Q, r1, r2, sel
+    X_tr = np.concatenate(X_tr_parts) if X_tr_parts else np.empty((0, len(FEATURES)), np.float32)
+    y_tr = np.concatenate(y_tr_parts) if y_tr_parts else np.empty(0, np.int8)
+    X_va = np.concatenate(X_va_parts) if X_va_parts else np.empty((0, len(FEATURES)), np.float32)
+    va_p1 = np.concatenate(va_p1_parts) if va_p1_parts else np.empty(0, np.int64)
+    va_p2 = np.concatenate(va_p2_parts) if va_p2_parts else np.empty(0, np.int64)
+    del X_tr_parts, y_tr_parts, X_va_parts, va_p1_parts, va_p2_parts, plan
     print(f"train matrix: {X_tr.shape}, val matrix: {X_va.shape}", flush=True)
 
     params = dict(cfg["model"]["params"])
@@ -185,57 +161,52 @@ def run(cfg: dict, force: bool = False) -> dict:
     booster.save_model(str(model_path))
     print(f"best iteration: {booster.best_iteration}")
 
+    # val scores for S7 calibration
+    p_va = booster.predict(X_va, num_iteration=booster.best_iteration).astype(np.float32)
+    pd.DataFrame({"s1_idx": va_p1, "cand_idx": va_p2, "p_match": p_va}).to_parquet(
+        val_scores_path, index=False)
+
     # LR baseline on a subsample
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import average_precision_score
     from sklearn.preprocessing import StandardScaler
 
-    idx = rng.choice(len(X_tr), size=min(500_000, len(X_tr)), replace=False)
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(X_tr), size=min(300_000, len(X_tr)), replace=False)
     scaler = StandardScaler().fit(X_tr[idx])
-    lr = LogisticRegression(max_iter=300).fit(scaler.transform(X_tr[idx]), y_tr[idx])
+    lr = LogisticRegression(max_iter=200).fit(scaler.transform(X_tr[idx]), y_tr[idx])
     lr_ap = average_precision_score(y_va, lr.predict_proba(scaler.transform(X_va))[:, 1])
-    del X_tr, y_tr, scaler, lr
-
-    p_va = booster.predict(X_va, num_iteration=booster.best_iteration)
     ap = average_precision_score(y_va, p_va)
     print(f"val pair AP: lgbm={ap:.5f} lr={lr_ap:.5f}")
-    pd.DataFrame({"s1_idx": va_p1, "cand_idx": va_p2, "p_match": p_va}).to_parquet(
-        val_scores_path, index=False)
-    del X_va, p_va
+    del X_tr, y_tr, X_va, p_va, scaler, lr
 
     imp = sorted(zip(FEATURES, booster.feature_importance("gain").tolist()), key=lambda kv: -kv[1])[:15]
     eval_ = {"val_pair_ap": float(ap), "lr_baseline_ap": float(lr_ap),
              "best_iteration": int(booster.best_iteration),
              "n_train_rows": int(tot_pos + tot_neg), "n_positives": int(tot_pos),
+             "n_val_rows": int(tot_val),
              "feature_importance": imp}
     io_utils.json_dump(eval_, art / "model_eval.json")
     _write_model_card(eval_, Path(cfg["paths"]["reports_dir"]) / "model_card.md")
 
-    # ---- test scoring (streaming, independently resumable) ----
+    # ---- test scoring: read persisted test features, predict, save ----
     if test_scores_dir.exists() and any(test_scores_dir.glob("shard_*.parquet")):
         print("test scores fresh — skipping")
         return eval_
     test_scores_dir.mkdir(parents=True, exist_ok=True)
-    t_s1_ids = pd.read_parquet(art / "features" / "test_pairs" / "s1_ids.parquet")["entity_id"].to_numpy()
-    t_cand_ids = pd.read_parquet(art / "features" / "test_pairs" / "cand_ids.parquet")["entity_id"].to_numpy()
-    tA, tB, t_is_s3 = _load_side_arrays(art / "normalized", "test")
     total = 0
-    for si, chunk in enumerate(iter_candidate_shards("test", cfg)):
-        p1 = tA.index.get_indexer(chunk["s1_entity_id"].to_numpy())
-        p2 = tB.index.get_indexer(chunk["cand_id"].to_numpy())
-        assert (p1 >= 0).all() and (p2 >= 0).all()
-        f = compute_features(tA, tB, p1, p2, t_is_s3[p2])
-        X = np.stack([f[name] for name in FEATURES], axis=1)
-        del f
-        p = np.empty(len(X), dtype=np.float32)
-        step = 5_000_000
-        for lo in range(0, len(X), step):
-            p[lo:lo + step] = booster.predict(X[lo:lo + step], num_iteration=booster.best_iteration)
-        io_utils.write_parquet(pd.DataFrame({"s1_idx": p1, "cand_idx": p2, "p_match": p}),
-                               test_scores_dir / f"shard_{si}.parquet", 1_000_000)
+    for si, (r1, r2, Q) in enumerate(iter_feature_shards("test", cfg)):
+        X = Q.astype(np.float32) / 255.0
+        p = booster.predict(X, num_iteration=booster.best_iteration).astype(np.float32)
+        del X, Q
+        io_utils.write_parquet(pd.DataFrame({
+            "s1_idx": r1.astype(np.int32),
+            "cand_idx": r2.astype(np.int32),
+            "p_match": p,
+        }), test_scores_dir / f"shard_{si}.parquet", 1_000_000)
         total += len(p)
         print(f"  scored test shard {si + 1}: cumulative {total:,}", flush=True)
-        del X, p
+        del r1, r2, p
     print(f"test scoring done: {total:,} pairs")
     return eval_
 
@@ -246,6 +217,7 @@ def _write_model_card(ev: dict, out: Path) -> None:
         f"- val pair average precision: **{ev['val_pair_ap']:.5f}** (logistic baseline {ev['lr_baseline_ap']:.5f})",
         f"- best iteration: {ev['best_iteration']}",
         f"- training rows: {ev['n_train_rows']:,} (positives {ev['n_positives']:,})",
+        f"- val calibration rows: {ev['n_val_rows']:,}",
         "",
         "## Top features (gain)",
         "\n".join(f"- `{k}`: {v:,.0f}" for k, v in ev["feature_importance"]),

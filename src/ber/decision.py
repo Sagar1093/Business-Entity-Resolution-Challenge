@@ -104,6 +104,16 @@ def run(cfg: dict, force: bool = False) -> dict:
     p2 = vs["cand_idx"].to_numpy()
     p_raw = vs["p_match"].to_numpy()
     del vs
+    # G/H union may contain duplicate (entity, cand) pairs — keep one per pair
+    # so the F0.5 sweep's predicted counts aren't inflated
+    packed = p1.astype(np.int64) * PACK_MUL + p2.astype(np.int64)
+    _, first_idx = np.unique(packed, return_index=True)
+    if len(first_idx) < len(packed):
+        keep = np.zeros(len(packed), dtype=bool)
+        keep[first_idx] = True
+        p1, p2, p_raw = p1[keep], p2[keep], p_raw[keep]
+        print(f"  deduped val scores: {len(keep):,} -> {len(first_idx):,}")
+    del packed
 
     # labels via packed GT
     gt_rows = [(s1, m) for s1, ms in gt_val.items() for m in ms]

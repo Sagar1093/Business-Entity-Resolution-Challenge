@@ -59,6 +59,9 @@ blocking:
 
 features:
   compression: zstd             # uint8 quantized shards compress ~2x vs snappy
+  n_s2_cap: 10                  # low-RAM/deadline mode: cap S2 cands per entity per source group
+  n_s3_cap: 10                  # ditto S3
+  max_pairs_per_shard: 20000000
   tfidf:
     name_analyzers: [char_wb_3_4, word]
     address_analyzers: [char_wb_3_4, word]
@@ -72,8 +75,8 @@ features:
 
 model:
   type: lightgbm
-  val_cap_per_s1: 40            # val calibration rows per entity (per shard) — time budget
-  train_neg_ratio: 3            # negatives kept per positive (index-based training)
+  val_cap_per_s1: 10            # val calibration rows per entity (per file) — low-RAM budget
+  train_neg_ratio: 2            # negatives kept per positive (low-RAM budget)
   train_pair_budget: 80000000   # informational cap for the sampling plan
   params:
     objective: binary

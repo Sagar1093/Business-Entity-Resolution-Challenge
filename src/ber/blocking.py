@@ -383,15 +383,48 @@ def iter_candidate_shards(split: str, cfg: dict):
             raise RuntimeError(
                 f"[{split}] {tag.upper()}/base shard-count mismatch: {len(files)} rescue vs "
                 f"{len(base_files)} base — shards must be slice-aligned. Regenerate both.")
-    cap = int((cfg.get("blocking", {}) or {}).get("union_cap_per_s1", 0)) or None
-    for name in names:
-        df = read_union_shard(split, cfg, name)
-        if df is None:
+def iter_candidate_shards(split: str, cfg: dict):
+    """Yield candidate DataFrames (batches OK; an entity may span yields).
+
+    Base mode: base shards already carry the internal per-S1 cap -> yielded
+    as-is.
+    Rescue-only mode (no base shards, e.g. after the position-bug fix):
+    stream G then H shard files in ROW-GROUP batches (no whole-file concat,
+    no cross-file dedup — downstream stages tolerate duplicates), applying
+    ``blocking.union_cap_per_s1`` per (file, entity) via numpy segment ranks
+    (rows are contiguous per entity within a file).
+    """
+    blk = Path(cfg["paths"]["artifacts_dir"]) / "blocking"
+    base_files = sorted((blk / f"{split}_candidates").glob("shard_*.parquet"))
+    if base_files:
+        for p in base_files:
+            yield pd.read_parquet(p)
+        return
+    cap = int((cfg.get("blocking", {}) or {}).get("union_cap_per_s1", 0)) or 0
+    for tag in ("g", "h"):
+        d = blk / f"{split}_candidates_{tag}"
+        if not d.exists():
             continue
-        if cap is not None:
-            keep = df.groupby("s1_entity_id", sort=False).cumcount() < cap
-            df = df[keep.to_numpy() if hasattr(keep, "to_numpy") else keep]
-        yield df
+        for p in sorted(d.glob("shard_*.parquet"), key=lambda x: int(x.stem.split("_")[1])):
+            carry_id, carry_rank = None, 0
+            for batch in io_utils.iter_parquet_chunks(p, 2_000_000):
+                s1 = batch["s1_entity_id"].to_numpy()
+                if not len(s1):
+                    continue
+                change = np.flatnonzero(s1[1:] != s1[:-1]) + 1
+                starts = np.r_[0, change]
+                seg_ranks = np.arange(len(s1)) - np.repeat(starts, np.diff(np.r_[starts, len(s1)]))
+                if carry_id is not None and s1[0] == carry_id:
+                    first_new = change[0] if len(change) else len(s1)
+                    seg_ranks[:first_new] += carry_rank
+                if cap:
+                    keep = seg_ranks < cap
+                    batch = batch[keep]
+                carry_id = s1[-1]
+                carry_rank = int(seg_ranks[len(s1) - 1]) + 1
+                if len(batch):
+                    yield batch
+                del batch, s1, seg_ranks
 
 
 def union_shard_names(split: str, cfg: dict) -> list[str]:
