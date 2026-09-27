@@ -59,8 +59,8 @@ blocking:
 
 features:
   compression: zstd             # uint8 quantized shards compress ~2x vs snappy
-  n_s2_cap: 10                  # low-RAM/deadline mode: cap S2 cands per entity per source group
-  n_s3_cap: 10                  # ditto S3
+  n_s2_cap: 8                   # low-RAM/deadline mode: cap S2 cands per entity (across whole union)
+  n_s3_cap: 8                   # ditto S3
   max_pairs_per_shard: 20000000
   tfidf:
     name_analyzers: [char_wb_3_4, word]

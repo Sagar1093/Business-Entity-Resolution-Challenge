@@ -319,38 +319,52 @@ def run(cfg: dict, force: bool = False) -> dict:
             buf, buf_rows = [], 0
             del id_block, f_block, block
 
+        carry_key = None   # (entity_idx, is_s3) of last row of previous batch
+        carry_rank = 0
         for chunk in iter_candidate_shards(split, cfg):
             p1 = s1.index.get_indexer(chunk["s1_entity_id"].to_numpy())
             p2 = s23l.index.get_indexer(chunk["cand_id"].to_numpy())
             if (p1 < 0).any() or (p2 < 0).any():
                 raise AssertionError("candidate id missing from normalized frames")
-            src_is_s3 = is_s3_all[p2]
-            for src_mask, cap in ((~src_is_s3, n_s2_cap), (src_is_s3, n_s3_cap)):
-                src_pos = np.where(src_mask)[0]
-                if not len(src_pos):
-                    continue
-                sl = pd.Series(src_pos).groupby(p1[src_pos] // 200_000)
-                for _gi, g in sl:
-                    # cap within (slice, source) group, without global dedup
-                    if len(g) > cap:
-                        g = g.iloc[:cap]
-                    if len(g) > BATCH_PAIRS_CAP:
-                        g = g.iloc[:BATCH_PAIRS_CAP]
-                    idx = g.to_numpy(dtype=np.int64)
-                    for lo in range(0, len(idx), BATCH_PAIRS):
-                        sel = idx[lo:lo + BATCH_PAIRS]
-                        q = compute_features_light(s1, s23l, p1[sel], p2[sel], src_is_s3[sel])
-                        pair_block = np.column_stack([
-                            p1[sel].astype(np.int32), p2[sel].astype(np.int32),
-                            _quantize_q(q).astype(np.int32),
-                        ])
-                        buf.append(pair_block)
-                        buf_rows += len(sel)
-                        total += len(sel)
-                        del q, pair_block
-                        if buf_rows >= max_shard:
-                            flush()
-            del chunk, p1, p2, src_is_s3
+            src = is_s3_all[p2].astype(np.int8)
+            # segment = contiguous (entity, source) run; rows are sorted by
+            # entity within each rescue file and each entity's candidates are
+            # two contiguous runs (S2 block then S3 block)
+            new_seg = np.r_[True, (p1[1:] != p1[:-1]) | (src[1:] != src[:-1])]
+            if carry_key is not None and len(p1) and (p1[0], src[0]) == carry_key:
+                new_seg[0] = False
+            starts = np.flatnonzero(new_seg)
+            bounds = np.r_[starts, len(p1)]
+            seg_lens = np.diff(bounds)
+            ranks = np.arange(len(p1)) - np.repeat(starts, seg_lens)
+            if carry_key is not None and not new_seg[0]:
+                ranks[:bounds[1]] += carry_rank
+            keep = ((src == 0) & (ranks < n_s2_cap)) | ((src == 1) & (ranks < n_s3_cap))
+            if keep.any():
+                k1, k2, ks = p1[keep], p2[keep], src[keep]
+                # batch-level dedup of (entity, cand) pairs (G and H overlap)
+                packed = k1.astype(np.int64) * len(s23l) + k2.astype(np.int64)
+                _, uidx = np.unique(packed, return_index=True)
+                del packed
+                uidx.sort()
+                k1, k2, ks = k1[uidx], k2[uidx], ks[uidx]
+                for lo in range(0, len(k1), BATCH_PAIRS):
+                    hi2 = min(lo + BATCH_PAIRS, len(k1))
+                    q = compute_features_light(s1, s23l, k1[lo:hi2], k2[lo:hi2],
+                                               ks[lo:hi2].astype(bool))
+                    pair_block = np.column_stack([
+                        k1[lo:hi2].astype(np.int32), k2[lo:hi2].astype(np.int32),
+                        _quantize_q(q).astype(np.int32),
+                    ])
+                    buf.append(pair_block)
+                    buf_rows += hi2 - lo
+                    total += hi2 - lo
+                    del q, pair_block
+                    if buf_rows >= max_shard:
+                        flush()
+            carry_key = (int(p1[-1]), int(src[-1])) if len(p1) else None
+            carry_rank = int(ranks[-1]) + 1 if len(p1) else 0
+            del chunk, p1, p2, src, ranks, keep
             print(f"  [{split}] featurized {total:,} pairs (shard {shard_id})", flush=True)
         flush()
         io_utils.save_manifest(out_dir / "shard_0.parquet" if shard_id else out_dir / ".keep",
