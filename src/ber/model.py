@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 from . import io_utils, metrics
-from .blocking import iter_candidate_shards
+from .blocking import iter_candidate_shards, union_shard_names, read_union_shard
 from .features import (FEATURES, SideArrays, compute_features, _NAME_COLS, _ADDR_COLS)
 
 PACK_MUL = 10_500_000  # > max cand index (10.3M)
@@ -103,27 +103,38 @@ def run(cfg: dict, force: bool = False) -> dict:
     seed = int(cfg["seed"])
 
     # ---- pass A: labels/counts + per-shard negative selection ----
-    shard_files = sorted((art / "blocking" / "train_candidates").glob("shard_*.parquet"))
+    shard_names = union_shard_names("train", cfg)
+    shard_files = [Path(cfg["paths"]["artifacts_dir"]) / "blocking" / "train_candidates" / n
+                   for n in shard_names]
+    val_cap = int(cfg["model"].get("val_cap_per_s1", 0)) or None
     plan: list[dict] = []
     tot_pos = tot_neg = 0
     print("pass A: counting positives/negatives per shard...", flush=True)
-    for si, sp in enumerate(shard_files):
-        cand = pd.read_parquet(sp)
+    for si, name in enumerate(shard_names):
+        cand = read_union_shard("train", cfg, name)
+        if cand is None:
+            plan.append({"shard": si, "name": name, "pos": np.empty(0, np.int64),
+                         "neg": np.empty(0, np.int64), "val": np.empty(0, np.int64)})
+            continue
+        if val_cap is not None:
+            keep = cand.groupby("s1_entity_id", sort=False).cumcount() < val_cap
+            cand = cand[keep.to_numpy() if hasattr(keep, "to_numpy") else keep]
         p1 = _pos_of(s1_ids, cand["s1_entity_id"].to_numpy())
         p2 = _pos_of(cand_ids, cand["cand_id"].to_numpy())
         y = _labels_for(p1, p2, gt_train)
         is_val = val_row_mask[p1]
-        y_eff = np.where(is_val, 0, y)  # val rows never count as train positives
         pos_idx = np.where((y == 1) & ~is_val)[0]
         neg_idx = np.where((y == 0) & ~is_val)[0]
         rng = np.random.default_rng(seed + si)
         take = min(len(neg_idx), neg_ratio * len(pos_idx))
         neg_sel = rng.choice(neg_idx, size=take, replace=False) if take else np.empty(0, np.int64)
         val_idx = np.where(is_val)[0]
-        plan.append({"shard": si, "pos": pos_idx, "neg": np.sort(neg_sel), "val": val_idx})
+        if val_cap is not None and len(val_idx) > val_cap:
+            val_idx = np.sort(rng.permutation(val_idx)[:val_cap])
+        plan.append({"shard": si, "name": name, "pos": pos_idx, "neg": np.sort(neg_sel), "val": val_idx})
         tot_pos += len(pos_idx)
         tot_neg += len(neg_sel)
-        print(f"  shard {si + 1}/{len(shard_files)}: pos={len(pos_idx):,} neg_kept={take:,} val={len(val_idx):,}", flush=True)
+        print(f"  shard {si + 1}/{len(shard_names)}: pos={len(pos_idx):,} neg_kept={take:,} val={len(val_idx):,}", flush=True)
         del cand, p1, p2, y
     print(f"pass A totals: positives={tot_pos:,} negatives_kept={tot_neg:,}", flush=True)
 
@@ -133,7 +144,10 @@ def run(cfg: dict, force: bool = False) -> dict:
     X_parts, y_parts = [], []
     va_X, va_p1_all, va_p2_all = [], [], []
     for item in plan:
-        cand = pd.read_parquet(shard_files[item["shard"]])
+        cand = read_union_shard("train", cfg, item["name"])
+        if val_cap is not None and cand is not None:
+            keep = cand.groupby("s1_entity_id", sort=False).cumcount() < val_cap
+            cand = cand[keep.to_numpy() if hasattr(keep, "to_numpy") else keep]
         p1 = _pos_of(s1_ids, cand["s1_entity_id"].to_numpy())
         p2 = _pos_of(cand_ids, cand["cand_id"].to_numpy())
         del cand

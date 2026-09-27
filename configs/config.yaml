@@ -32,6 +32,7 @@ blocking:
   # never a hard-coded country list. Any country string works, France included.
   per_country: true
   candidate_cap_per_s1: 1000   # per-S1 union cap; audited for recall on val
+  union_cap_per_s1: 250        # emergency union trim (base->G->H priority) for disk/time budget
   recall_gate_pair: 0.999      # blocking audit gates (measured on val split)
   recall_gate_entity: 0.995
   strategies:
@@ -71,6 +72,7 @@ features:
 
 model:
   type: lightgbm
+  val_cap_per_s1: 40            # val calibration rows per entity (per shard) — time budget
   train_neg_ratio: 3            # negatives kept per positive (index-based training)
   train_pair_budget: 80000000   # informational cap for the sampling plan
   params:

@@ -355,29 +355,75 @@ def iter_candidate_shards(split: str, cfg: dict):
     Merges the base shards with the slice-aligned rescue shards (G trigram,
     H address-token) when present; dedup via pair columns. Consumed by
     features/outputs.
+
+    Emergency rescue-only mode: when the base directory has no shards (e.g.
+    invalidated by a blocking bug fix), the union is built over the G/H
+    shard names alone — every consumer (features, model, outputs) sees the
+    SAME candidate set, so the candidate_pairs.tsv invariant still holds.
+
+    ``blocking.union_cap_per_s1`` truncates the union per S1 entity in
+    priority order (base, then G, then H — each written score-descending).
+    Base slices partition S1, so a per-shard cap is a global per-S1 cap.
     """
-    out_dir = Path(cfg["paths"]["artifacts_dir"]) / "blocking" / f"{split}_candidates"
+    blk = Path(cfg["paths"]["artifacts_dir"]) / "blocking"
+    out_dir = blk / f"{split}_candidates"
     extra_maps: list[dict[str, Path]] = []
     for tag in ("g", "h"):
-        d = Path(cfg["paths"]["artifacts_dir"]) / "blocking" / f"{split}_candidates_{tag}"
+        d = blk / f"{split}_candidates_{tag}"
         if d.exists():
             extra_maps.append({p.name: p for p in sorted(d.glob("shard_*.parquet"))})
     base_files = sorted(out_dir.glob("shard_*.parquet"))
+    if base_files:
+        names = [p.name for p in base_files]
+    else:
+        names = sorted(set().union(*[set(m) for m in extra_maps])) if extra_maps else []
     for i, files in enumerate(extra_maps):
-        if files and len(files) != len(base_files):
+        if files and base_files and len(files) != len(base_files):
             tag = ("g", "h")[i]
             raise RuntimeError(
                 f"[{split}] {tag.upper()}/base shard-count mismatch: {len(files)} rescue vs "
                 f"{len(base_files)} base — shards must be slice-aligned. Regenerate both.")
-    for p in base_files:
-        base = pd.read_parquet(p)
-        for files in extra_maps:
-            extra = files.get(p.name)
-            if extra is not None:
-                base = pd.concat([base, pd.read_parquet(extra, columns=["s1_entity_id", "cand_id"])],
-                                 ignore_index=True)
-        base = base.drop_duplicates(subset=["s1_entity_id", "cand_id"])
-        yield base
+    cap = int((cfg.get("blocking", {}) or {}).get("union_cap_per_s1", 0)) or None
+    for name in names:
+        df = read_union_shard(split, cfg, name)
+        if df is None:
+            continue
+        if cap is not None:
+            keep = df.groupby("s1_entity_id", sort=False).cumcount() < cap
+            df = df[keep.to_numpy() if hasattr(keep, "to_numpy") else keep]
+        yield df
+
+
+def union_shard_names(split: str, cfg: dict) -> list[str]:
+    """Shard names of the union (base if present, else the G/H rescue names)."""
+    blk = Path(cfg["paths"]["artifacts_dir"]) / "blocking"
+    base_files = sorted((blk / f"{split}_candidates").glob("shard_*.parquet"))
+    if base_files:
+        return [p.name for p in base_files]
+    names: set[str] = set()
+    for tag in ("g", "h"):
+        d = blk / f"{split}_candidates_{tag}"
+        if d.exists():
+            names.update(p.name for p in d.glob("shard_*.parquet"))
+    return sorted(names)
+
+
+def read_union_shard(split: str, cfg: dict, name: str) -> pd.DataFrame | None:
+    """One union shard (base + G + H for `name`), deduped, uncapped."""
+    blk = Path(cfg["paths"]["artifacts_dir"]) / "blocking"
+    frames = []
+    bp = blk / f"{split}_candidates" / name
+    if bp.exists():
+        frames.append(pd.read_parquet(bp))
+    for tag in ("g", "h"):
+        ep = blk / f"{split}_candidates_{tag}" / name
+        if ep.exists():
+            frames.append(pd.read_parquet(ep, columns=["s1_entity_id", "cand_id"]))
+    if not frames:
+        return None
+    df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+    del frames
+    return df.drop_duplicates(subset=["s1_entity_id", "cand_id"])
 
 
 def run(cfg: dict, force: bool = False) -> dict:
